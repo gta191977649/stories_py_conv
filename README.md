@@ -70,7 +70,7 @@ MOCAPPS2.IMG
     └── *.col2
 ```
 
-Important: `MOCAPPS2.IMG` is not map archive. It contains non-static assets such as cutscene, animation, and related story resources. This tool does not try to convert those. For `MOCAPPS2.IMG`, the current scope is still only static/map-style resources that can be exported as:
+Important: `MOCAPPS2.IMG` is not a pure map archive. It contains non-static assets such as cutscene, animation, and related story resources. This tool does not try to convert those. For `MOCAPPS2.IMG`, the current scope is still only static/map-style resources that can be exported as:
 
 ```text
 *.mdl  -> .dff
@@ -170,7 +170,9 @@ area-patched resource table
 -> sector overlay resources
 ```
 
-That is why these archives cannot be treated like `GTA3PS2.IMG`, and why loading only sector overlay resources is incomplete.
+Important: sector overlay resources are not always one clean blob per `resId`. The same `resId` can appear in several sectors with different overlay blob variants. The extractor keeps multiple variants for the same `resId` and tries them in descending usefulness, because the first-seen overlay blob is often truncated for neon/light resources.
+
+That is why these archives cannot be treated like `GTA3PS2.IMG`, and why loading only one sector overlay blob per resource id is incomplete.
 
 ### Where textures are
 
@@ -200,6 +202,8 @@ IMG WRLD chunk body
 -> sector overlay resource
 -> texture blob
 ```
+
+As with geometry, a streamed texture resource can have more than one sector-local overlay variant for the same `resId`. The extractor tries all candidates until one decodes successfully.
 
 ### How naming works
 
@@ -257,6 +261,43 @@ IDE model name
 -> one output model file under the archive folder
 ```
 
+### Streamed decoder behavior
+
+The streamed decoder does not rely on one resource layout. It currently tries these geometry paths:
+
+```text
+1. streamed building-geometry header
+   -> explicit mesh descriptors
+   -> per-mesh DMA/VIF packets
+
+2. flat MDL-style geometry blob
+   -> shared material list
+   -> mesh groups
+
+3. wrapped embedded UNPACK stream
+   -> find a VIF payload inside a larger resource blob
+
+4. position-only transparent/light fallback
+   -> build triangle strips from position data only
+   -> used for simple neon/light resources with no full material table
+```
+
+That last fallback is important for VCS signage, neon, and light-strip resources. Many of those blobs are tiny transparent-pass resources rather than full building meshes.
+
+### Fragment filtering during export
+
+Some streamed models contain one bad fragment mixed into otherwise valid geometry. The exporter now validates each transformed fragment before merge:
+
+```text
+decoded fragment
+-> apply placement matrix
+-> reject NaN / Inf / extreme coordinate fragments
+-> keep valid fragments
+-> export salvaged model if enough geometry remains
+```
+
+This prevents one corrupt streamed fragment from causing the whole model export to fail.
+
 ## Notes
 
 - The `.DIR` path is treated as the directory file for an IMG, not as a folder path.
@@ -265,7 +306,9 @@ IDE model name
   - area/master/overlay resource counts
   - no-link / no-resource / decode-failure counts
   - models recovered only from area or interior data
+  - `skipped_bad_fragments` and `salvaged_models`
   - swap/default-visible conflict notes
+  - unresolved `hash_*` naming fallbacks
   - missing-model breakdown by IDE file
 - Standard `MDL` / `TEX` / `COL2` conversion now runs in pure Python using BLeeds parsing logic plus DragonFF RW writers.
 - The required reference data is bundled in this repo:
@@ -274,4 +317,5 @@ IDE model name
   - `bruteforcedvcsnames.inc`
 - The required pure-Python helper code is also vendored in this repo, so the tool no longer depends on sibling checkouts of `g3DTZ`, `librwgta`, `BLeeds`, or `DragonFF`.
 - `BEACH`, `MAINLA`, and `MALL` now use a pure-Python streamed exporter with world, interior, and area-resource loading.
+- Streamed neon/light resources are now handled as best-effort geometry too, including small wrapped transparent-pass blobs that only expose position strips.
 - Coverage is still best-effort: some streamed resources are malformed, unresolved, or too extreme for DragonFF mesh/collision writers, and those cases are recorded in `report.txt` instead of aborting the run.
