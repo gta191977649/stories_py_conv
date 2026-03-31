@@ -11,6 +11,7 @@ from .models import ReportData, StreamedArchivePlan, StreamedPlacement
 from .pure_backend import DecodedTexture, MeshData, write_col_from_mesh, write_dff_from_mesh, write_txd_from_decoded_textures
 from .streamed_world import LevelChunk, parse_area_resource_table
 from .utils import sanitize_filename
+from .vendor.bleeds.tex import Ps2TexHeader, decode_ps2_texture, parse_ps2_header
 
 
 UNPACK = 0x6C018000
@@ -143,34 +144,25 @@ class LVZArchive:
         return None, None
 
     def _decode_texture_blob(self, blob: bytes, res_id: int) -> DecodedTexture | None:
-        if len(blob) < 64:
+        if len(blob) < 16:
             return None
-        try:
-            palette = np.frombuffer(blob[-64:], dtype=np.uint8).reshape(16, 4).copy()
-        except ValueError:
+        parsed = parse_ps2_header((b"\x00" * 16) + blob, 16)
+        if parsed is None:
             return None
-        alpha = (palette[:, 3].astype(np.uint16) * 255 + 64) // 128
-        palette[:, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
-        index_blob = blob[:-64]
-        if not index_blob:
+        header = Ps2TexHeader(
+            reserved0=parsed.reserved0,
+            reserved1=parsed.reserved1,
+            raster_offset=16,
+            flags=parsed.flags,
+        )
+        rgba = decode_ps2_texture(blob, header, len(blob) - 16)
+        if rgba is None:
             return None
-        pixels = np.empty(len(index_blob) * 2, dtype=np.uint8)
-        raw = np.frombuffer(index_blob, dtype=np.uint8)
-        pixels[0::2] = raw & 0x0F
-        pixels[1::2] = raw >> 4
-        total_pixels = len(pixels)
-        width = int(2 ** round(math.log2(max(16, int(total_pixels ** 0.5)))))
-        while total_pixels % width != 0 and width > 16:
-            width //= 2
-        height = max(1, total_pixels // width)
-        if width * height != total_pixels:
-            return None
-        rgba = palette[np.clip(pixels[: total_pixels], 0, 15)].reshape(height, width, 4)
         return DecodedTexture(
             name=f"{self.archive_name.lower()}_{res_id}",
             rgba=rgba.astype(np.uint8).tobytes(),
-            width=width,
-            height=height,
+            width=int(rgba.shape[1]),
+            height=int(rgba.shape[0]),
         )
 
     def texture_for_res_id(self, res_id: int) -> DecodedTexture | None:
@@ -570,6 +562,7 @@ def export_streamed_archive(
     output_root: Path,
     plan: StreamedArchivePlan,
     report: ReportData,
+    global_knackers_textures: dict[str, DecodedTexture] | None = None,
 ) -> dict[str, int]:
     _log(f"[streamed] load {archive_name}.LVZ")
     archive = LVZArchive(archive_name, root / f"{archive_name}.LVZ", root / f"{archive_name}.IMG")
@@ -577,7 +570,7 @@ def export_streamed_archive(
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     textures_by_txd: dict[str, dict[str, DecodedTexture]] = {}
-    knackers_textures: dict[str, DecodedTexture] = {}
+    knackers_textures = global_knackers_textures if global_knackers_textures is not None else {}
     exported_models = 0
     missing_res_ids = 0
     no_resource_res_ids = 0
@@ -740,10 +733,12 @@ def export_streamed_archive(
 
     for txd_name, textures in textures_by_txd.items():
         if textures:
+            if txd_name.lower() == "knackers":
+                continue
             write_txd_from_decoded_textures(archive_dir / f"{sanitize_filename(txd_name)}.txd", list(textures.values()))
             _log(f"[streamed] wrote {archive_name}/{sanitize_filename(txd_name)}.txd")
 
-    if knackers_textures:
+    if global_knackers_textures is None and knackers_textures:
         write_txd_from_decoded_textures(output_root / "knackers.txd", list(knackers_textures.values()))
         _log("[streamed] updated knackers.txd")
 
@@ -762,7 +757,7 @@ def export_streamed_archive(
         "dff_failed_models": dff_failed_models,
         "skipped_bad_fragments": skipped_bad_fragments,
         "salvaged_models": salvaged_models,
-        "exported_txds": sum(1 for textures in textures_by_txd.values() if textures),
+        "exported_txds": sum(1 for txd_name, textures in textures_by_txd.items() if textures and txd_name.lower() != "knackers"),
         "decoded_textures": sum(1 for texture in archive.texture_cache.values() if texture is not None),
         "loaded_master_resource_blobs": len(archive.master_raw_by_res_id),
         "loaded_area_resource_blobs": len(archive.area_raw_by_res_id),

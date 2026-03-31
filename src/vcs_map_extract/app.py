@@ -12,7 +12,7 @@ from .ipl_parser import parse_ipl_directory
 from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import write_packed_img
-from .pure_backend import run_conversion_jobs
+from .pure_backend import DecodedTexture, run_conversion_jobs, write_txd_from_decoded_textures
 from .report import write_report
 from .streamed_backend import export_streamed_archive
 from .streamed_world import plan_streamed_archive
@@ -144,6 +144,10 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
     safe_mkdir(output_root)
     for archive_name in ARCHIVE_ORDER:
         safe_mkdir(output_root / archive_name)
+    for archive_name in STREAMED_ARCHIVES:
+        stale_knackers = output_root / archive_name / "knackers.txd"
+        if stale_knackers.exists():
+            stale_knackers.unlink()
 
     ide_catalog = parse_ide_directory(root / "ide")
     resolver = NameResolver(ide_catalog)
@@ -178,6 +182,7 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
         summary[archive_name].update(plan.summary)
         report.unresolved_streamed_names.extend(plan.unresolved_names)
 
+    global_knackers_textures: dict[str, DecodedTexture] = {}
     for plan in streamed_plans:
         archive_name = plan.archive_name
         if not plan.model_exports and not plan.txd_exports:
@@ -187,7 +192,14 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
             f"{len(plan.model_exports)} models, {len(plan.txd_exports)} txd groups"
         )
         try:
-            metrics = export_streamed_archive(archive_name, root, output_root, plan, report)
+            metrics = export_streamed_archive(
+                archive_name,
+                root,
+                output_root,
+                plan,
+                report,
+                global_knackers_textures=global_knackers_textures,
+            )
             summary[archive_name].update(metrics)
             _log(
                 f"[streamed] finished {archive_name}: "
@@ -199,6 +211,10 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
             report.unresolved_streamed_names.append(f"{archive_name}: streamed export failed: {exc}")
             summary[archive_name]["streamed_failed"] = 1
             _log(f"[streamed] FAILED {archive_name}: {exc}")
+
+    if global_knackers_textures:
+        write_txd_from_decoded_textures(output_root / "knackers.txd", list(global_knackers_textures.values()))
+        _log("[streamed] wrote root knackers.txd")
 
     _ensure_knackers_txd(output_root)
 
