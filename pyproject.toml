@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcs-map-extract"
+version = "0.1.0"
+description = "Python CLI for GTA VCS PS2 map/static extraction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+]
+
+[project.scripts]
+vcs-map-extract = "vcs_map_extract.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
