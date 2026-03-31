@@ -18,8 +18,26 @@ def write_report(path: Path, report: ReportData) -> None:
     lines.extend(report.missing_models or ["<none>"])
 
     lines.append("")
+    lines.append("Missing Models By IDE")
+    if report.missing_models_by_source_file:
+        for source_file in sorted(report.missing_models_by_source_file):
+            names = report.missing_models_by_source_file[source_file]
+            lines.append(f"{source_file}: {len(names)}")
+            lines.extend(f"  {name}" for name in names)
+    else:
+        lines.append("<none>")
+
+    lines.append("")
+    lines.append("IPL Diagnostics")
+    lines.extend(report.ipl_diagnostics or ["<none>"])
+
+    lines.append("")
     lines.append("Unresolved Streamed Names")
     lines.extend(report.unresolved_streamed_names or ["<none>"])
+
+    lines.append("")
+    lines.append("Streamed Diagnostics")
+    lines.extend(report.streamed_diagnostics or ["<none>"])
 
     lines.append("")
     lines.append("Duplicate Pack Conflicts")

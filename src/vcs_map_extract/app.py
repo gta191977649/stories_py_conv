@@ -8,6 +8,7 @@ from pathlib import Path
 from .constants import ARCHIVE_ORDER, EXPECTED_FILES, STANDARD_ARCHIVES, STREAMED_ARCHIVES
 from .ide_catalog import parse_ide_directory
 from .img_io import ImgDirectoryEntry, ImgReader
+from .ipl_parser import parse_ipl_directory
 from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import write_packed_img
@@ -148,6 +149,20 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
     resolver = NameResolver(ide_catalog)
     report = ReportData()
     summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    ipl_summary = parse_ipl_directory(root / "ipl")
+    for source_file in sorted(ipl_summary.inst_count_by_file):
+        report.ipl_diagnostics.append(
+            f"{source_file}: inst_rows={ipl_summary.inst_count_by_file[source_file]}, "
+            f"nonzero_interiors={ipl_summary.nonzero_interior_by_file.get(source_file, 0)}"
+        )
+    if any(ipl_summary.nonzero_interior_by_file.values()):
+        report.ipl_diagnostics.append(
+            f"nonzero interior IPL rows detected: {len(ipl_summary.nonzero_instances)}"
+        )
+    else:
+        report.ipl_diagnostics.append(
+            "ipl/*.ipl did not expose nonzero interior ids in this dump; LVZ interior swaps were used instead"
+        )
 
     with tempfile.TemporaryDirectory(prefix="vcs_map_extract_raw_") as tmpdir:
         standard_jobs = _queue_standard_jobs(Path(tmpdir), root, output_root, ide_catalog, summary)
@@ -193,6 +208,15 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
         for model in ide_catalog.values()
         if not any((output_root / archive / f"{sanitize_filename(model.model_name)}.dff").exists() for archive in ARCHIVE_ORDER)
     )
+    missing_by_source_file: dict[str, list[str]] = defaultdict(list)
+    missing_lookup = set(report.missing_models)
+    for model in ide_catalog.values():
+        if model.model_name in missing_lookup:
+            missing_by_source_file[model.source_file].append(model.model_name)
+    report.missing_models_by_source_file = {
+        source_file: sorted(names)
+        for source_file, names in sorted(missing_by_source_file.items())
+    }
 
     if packimg:
         _log("[packimg] writing OUTPUT/vcs_map.img")

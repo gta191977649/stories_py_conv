@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import math
 import struct
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .models import ReportData, StreamedArchivePlan
+from .models import ReportData, StreamedArchivePlan, StreamedPlacement
 from .pure_backend import DecodedTexture, MeshData, write_col_from_mesh, write_dff_from_mesh, write_txd_from_decoded_textures
+from .streamed_world import LevelChunk, parse_area_resource_table
 from .utils import sanitize_filename
 
 
@@ -17,11 +17,6 @@ UNPACK = 0x6C018000
 STMASK = 0x20000000
 STROW = 0x30000000
 MSCAL = 0x14000006
-WRLD_IDENT = 0x57524C44
-LEVEL_BODY_OFFSET = 0x20
-SECLIST_END_INDEX = 8
-SECTOR_HEADER_PTR_OFFSET = LEVEL_BODY_OFFSET + 0x04
-SECTOR_HEADER_STRUCT = struct.Struct("<IIIIIIIHH")
 
 
 def _log(message: str) -> None:
@@ -30,10 +25,6 @@ def _log(message: str) -> None:
 
 def read_u32(blob: bytes, offset: int) -> int:
     return struct.unpack_from("<I", blob, offset)[0]
-
-
-def read_u16(blob: bytes, offset: int) -> int:
-    return struct.unpack_from("<H", blob, offset)[0]
 
 
 def read_i16(blob: bytes, offset: int) -> int:
@@ -50,22 +41,6 @@ def align_down4(offset: int) -> int:
 
 def half_to_float(value: int) -> float:
     return float(np.frombuffer(struct.pack("<H", value), dtype=np.float16)[0])
-
-
-def maybe_decompress(blob: bytes) -> bytes:
-    if not blob:
-        return blob
-    if len(blob) >= 2 and blob[0] == 0x78 and blob[1] in (0x01, 0x9C, 0xDA):
-        try:
-            return zlib.decompress(blob)
-        except zlib.error:
-            pass
-    for wbits in (16 + zlib.MAX_WBITS, -zlib.MAX_WBITS):
-        try:
-            return zlib.decompress(blob, wbits)
-        except zlib.error:
-            continue
-    return blob
 
 
 @dataclass(slots=True)
@@ -97,157 +72,55 @@ class ParsedStreamedGeometry:
     faces: list[tuple[int, int, int]]
     uvs: list[tuple[float, float]]
     face_texture_res_ids: list[int]
+    resource_origin: str
 
 
 class LVZArchive:
     def __init__(self, archive_name: str, lvz_path: Path, img_path: Path) -> None:
         self.archive_name = archive_name
-        self.lvz_path = lvz_path
-        self.img_path = img_path
-        self.data = maybe_decompress(lvz_path.read_bytes())
-        self.img_bytes = img_path.read_bytes()
-        self.rows = self._walk_master_resource_table()
-        self.row_by_index = {row["index"]: row for row in self.rows}
+        self.level = LevelChunk.from_archive(lvz_path.parent, archive_name)
+        self.master_raw_by_res_id = self._load_master_resources()
+        self.area_raw_by_res_id = self._load_area_resources()
         self.overlay_raw_by_res_id = self._load_sector_overlay_resources()
-        self.texture_by_res_id = self._decode_textures()
-        self.overlay_texture_by_res_id: dict[int, DecodedTexture] = {}
+        self.texture_cache: dict[int, DecodedTexture | None] = {}
         self.geometry_cache: dict[int, ParsedStreamedGeometry | None] = {}
 
-    def _ptr_to_body_offset(self, raw_ptr: int) -> int:
-        return raw_ptr - LEVEL_BODY_OFFSET
+    def _load_master_resources(self) -> dict[int, bytes]:
+        pointers = self.level.read_master_resource_pointers()
+        ordered = sorted((ptr, res_id) for res_id, ptr in pointers.items())
+        boundaries = [ptr for ptr, _res_id in ordered] + [len(self.level.data)]
+        resources: dict[int, bytes] = {}
+        for index, (ptr, res_id) in enumerate(ordered):
+            end = boundaries[index + 1]
+            if end > ptr:
+                resources[res_id] = self.level.data[ptr:end]
+        return resources
 
-    def _iter_sector_headers(self):
-        header_table = read_u32(self.data, SECTOR_HEADER_PTR_OFFSET)
-        for index in range(4096):
-            off = header_table + (index * SECTOR_HEADER_STRUCT.size)
-            if off + SECTOR_HEADER_STRUCT.size > len(self.data):
-                break
-            ident, shrink, file_size, data_size, reloc_tab, num_relocs, global_tab, num_classes, num_funcs = SECTOR_HEADER_STRUCT.unpack_from(self.data, off)
-            if ident != WRLD_IDENT:
-                break
-            yield {
-                "index": index,
-                "file_size": file_size,
-                "global_tab": global_tab,
-            }
-
-    def _resource_slices(self, body: bytes, pointer_offsets: list[int]) -> dict[int, bytes]:
-        if len(body) < 8:
-            return {}
-        resources_ptr = self._ptr_to_body_offset(read_u32(body, 0))
-        num_resources = read_u16(body, 4)
-        if not (0 <= resources_ptr < len(body)):
-            return {}
-        count = min(num_resources, max(0, (len(body) - resources_ptr) // 8))
-        entries: list[tuple[int, int]] = []
-        for index in range(count):
-            off = resources_ptr + (index * 8)
-            if off + 8 > len(body):
-                break
-            res_id = read_u32(body, off)
-            data_ptr = self._ptr_to_body_offset(read_u32(body, off + 4))
-            if 0 <= data_ptr < len(body):
-                entries.append((res_id, data_ptr))
-        boundaries = sorted({len(body), resources_ptr, *[ptr for ptr in pointer_offsets if 0 <= ptr <= len(body)], *[data_ptr for _, data_ptr in entries]})
-        slices: dict[int, bytes] = {}
-        for res_id, data_ptr in entries:
-            next_boundary = next((value for value in boundaries if value > data_ptr), len(body))
-            if next_boundary > data_ptr:
-                slices.setdefault(res_id, body[data_ptr:next_boundary])
-        return slices
+    def _load_area_resources(self) -> dict[int, bytes]:
+        resources: dict[int, bytes] = {}
+        for area_index, area in enumerate(self.level.areas):
+            _log(f"[streamed] {self.archive_name} area {area_index + 1}/{len(self.level.areas)}")
+            for res_id, blob in parse_area_resource_table(self.level, area).items():
+                resources[res_id] = blob
+        return resources
 
     def _load_sector_overlay_resources(self) -> dict[int, bytes]:
         resources: dict[int, bytes] = {}
-        for sector in self._iter_sector_headers():
-            start = sector["global_tab"]
-            end = start + max(0, sector["file_size"] - LEVEL_BODY_OFFSET)
-            body = self.img_bytes[start:end]
-            if len(body) < 48:
-                continue
-            passes_base = 0x08
-            pointer_offsets = [
-                self._ptr_to_body_offset(read_u32(body, 0)),
-                *(
-                    self._ptr_to_body_offset(read_u32(body, passes_base + (index * 4)))
-                    for index in range(SECLIST_END_INDEX + 1)
-                ),
-                self._ptr_to_body_offset(read_u32(body, 48)),
-            ]
-            for res_id, blob in self._resource_slices(body, pointer_offsets).items():
+        reachable = self.level.iter_reachable_sectors()
+        for sector_id in sorted(reachable):
+            sector = self.level.parse_sector(sector_id)
+            for res_id, blob in sector.resources.items():
                 resources.setdefault(res_id, blob)
         return resources
 
-    def _parse_master_header(self) -> tuple[int, int]:
-        if len(self.data) < 0x24:
-            raise ValueError(f"{self.lvz_path} is too small to be a valid LVZ")
-        return read_u32(self.data, 0x20), self._parse_resource_count()
-
-    def _parse_resource_count(self) -> int:
-        cursor = 0x24
-        n = len(self.data)
-        while cursor + 8 <= n:
-            addr = read_u32(self.data, cursor)
-            reserved = read_u32(self.data, cursor + 4)
-            plausible = 0 < addr < n and (addr & 0x3) == 0 and (reserved == 0 or (reserved & 0xFFFF) == 0)
-            if not plausible:
-                break
-            cursor += 8
-        return read_u32(self.data, cursor) & 0xFFFF if cursor + 4 <= n else 0
-
-    def _classify_entry_peek(self, res_addr: int) -> tuple[str, dict[str, int]]:
-        if res_addr <= 0 or res_addr + 8 > len(self.data):
-            return "INVALID", {}
-        a16 = read_u16(self.data, res_addr)
-        a32 = read_u32(self.data, res_addr)
-        b32 = read_u32(self.data, res_addr + 4)
-        if a16 == 0:
-            return "UNK_FAC0", {}
-        if a16 <= 100:
-            return "MDL", {}
-        return "TEX_REF", {"ref_addr": a32, "embedded_res_id": b32}
-
-    def _walk_master_resource_table(self) -> list[dict[str, int]]:
-        res_table_addr, res_count = self._parse_master_header()
-        rows: list[dict[str, int]] = []
-        for index in range(res_count):
-            off = res_table_addr + (index * 8)
-            if off + 8 > len(self.data):
-                break
-            res_addr = read_u32(self.data, off)
-            kind, info = self._classify_entry_peek(res_addr)
-            rows.append(
-                {
-                    "index": index,
-                    "res_addr": res_addr,
-                    "kind": kind,
-                    "ref_addr": info.get("ref_addr", 0),
-                    "embedded_res_id": info.get("embedded_res_id", 0),
-                }
-            )
-        return rows
-
-    def _decode_textures(self) -> dict[int, DecodedTexture]:
-        tex_rows = [row for row in self.rows if row["kind"] == "TEX_REF" and row.get("ref_addr", 0) > 0]
-        tex_rows.sort(key=lambda row: row["ref_addr"])
-        decoded: dict[int, DecodedTexture] = {}
-        last_ref = None
-        unique_rows = []
-        for row in tex_rows:
-            if row["ref_addr"] != last_ref:
-                unique_rows.append(row)
-                last_ref = row["ref_addr"]
-        for index, row in enumerate(unique_rows):
-            start = row["ref_addr"]
-            if start <= 0 or start >= len(self.data):
-                continue
-            end = unique_rows[index + 1]["ref_addr"] if index + 1 < len(unique_rows) else len(self.data)
-            end = min(end, len(self.data))
-            if end <= start or end - start < 64:
-                continue
-            texture = self._decode_texture_blob(self.data[start:end], row["index"])
-            if texture is not None:
-                decoded[row["index"]] = texture
-        return decoded
+    def resource_blob_for_res_id(self, res_id: int) -> tuple[bytes | None, str | None]:
+        if res_id in self.area_raw_by_res_id:
+            return self.area_raw_by_res_id[res_id], "area"
+        if res_id in self.master_raw_by_res_id:
+            return self.master_raw_by_res_id[res_id], "master"
+        if res_id in self.overlay_raw_by_res_id:
+            return self.overlay_raw_by_res_id[res_id], "overlay"
+        return None, None
 
     def _decode_texture_blob(self, blob: bytes, res_id: int) -> DecodedTexture | None:
         if len(blob) < 64:
@@ -280,6 +153,12 @@ class LVZArchive:
             height=height,
         )
 
+    def texture_for_res_id(self, res_id: int) -> DecodedTexture | None:
+        if res_id not in self.texture_cache:
+            blob, _origin = self.resource_blob_for_res_id(res_id)
+            self.texture_cache[res_id] = self._decode_texture_blob(blob, res_id) if blob else None
+        return self.texture_cache[res_id]
+
     def _find_unpack_near(self, blob: bytes, offset: int, window: int = 8) -> int:
         start = max(0, offset - window)
         end = min(len(blob), offset + window + 4)
@@ -289,18 +168,20 @@ class LVZArchive:
         raise ValueError(f"UNPACK header not found near 0x{offset:08X}")
 
     def _parse_mdl_material_list(self, blob: bytes, base: int) -> tuple[list[MDLMaterial], int]:
-        count = read_u16(blob, base)
-        size_bytes = read_u16(blob, base + 2)
+        if base + 4 > len(blob):
+            return [], base
+        count = struct.unpack_from("<H", blob, base)[0]
+        size_bytes = struct.unpack_from("<H", blob, base + 2)[0]
         off = base + 4
         materials: list[MDLMaterial] = []
         limit = min(len(blob), base + 4 + size_bytes)
         for _ in range(count):
             if off + 22 > limit:
                 break
-            texture_id = read_u16(blob, off)
-            tri_raw = read_u16(blob, off + 2)
-            u_scale = half_to_float(read_u16(blob, off + 4)) or 1.0
-            v_scale = half_to_float(read_u16(blob, off + 6)) or 1.0
+            texture_id = struct.unpack_from("<H", blob, off)[0]
+            tri_raw = struct.unpack_from("<H", blob, off + 2)[0]
+            u_scale = half_to_float(struct.unpack_from("<H", blob, off + 4)[0]) or 1.0
+            v_scale = half_to_float(struct.unpack_from("<H", blob, off + 6)[0]) or 1.0
             materials.append(MDLMaterial(texture_id, tri_raw & 0x7FFF, u_scale, v_scale))
             off += 22
         while off < len(blob) and blob[off] == 0xAA:
@@ -336,10 +217,7 @@ class LVZArchive:
         w += 4
         if w + (count_all * 6) > len(blob):
             raise ValueError("Position payload truncated")
-        verts = [
-            self._read_vec3_i16_norm(blob, w + ((index + skip) * 6))
-            for index in range(count)
-        ]
+        verts = [self._read_vec3_i16_norm(blob, w + ((index + skip) * 6)) for index in range(count)]
         w = align_up4(w + (count_all * 6))
         if read_u32(blob, w) != STMASK:
             raise ValueError("Missing STMASK before UVs")
@@ -352,10 +230,7 @@ class LVZArchive:
         w += 4
         if w + (count_all * 2) > len(blob):
             raise ValueError("UV payload truncated")
-        uvs = [
-            self._read_uv(blob, w + ((index + skip) * 2))
-            for index in range(count)
-        ]
+        uvs = [self._read_uv(blob, w + ((index + skip) * 2)) for index in range(count)]
         w = align_up4(w + (count_all * 2))
         if (read_u32(blob, w) & 0xFF004000) != 0x6F000000:
             raise ValueError("Unexpected prelight header")
@@ -421,29 +296,14 @@ class LVZArchive:
             strip.uvs = [(u * current.u_scale, v * current.v_scale) for u, v in strip.uvs]
             acc += length
 
-    def texture_for_res_id(self, res_id: int) -> DecodedTexture | None:
-        texture = self.texture_by_res_id.get(res_id)
-        if texture is not None:
-            return texture
-        if res_id not in self.overlay_texture_by_res_id:
-            blob = self.overlay_raw_by_res_id.get(res_id)
-            self.overlay_texture_by_res_id[res_id] = self._decode_texture_blob(blob, res_id) if blob else None
-        return self.overlay_texture_by_res_id.get(res_id)
-
     def geometry_for_res_id(self, res_id: int) -> ParsedStreamedGeometry | None:
         if res_id in self.geometry_cache:
             return self.geometry_cache[res_id]
-        row = self.row_by_index.get(res_id)
-        if row is not None and row["kind"] == "MDL" and row["res_addr"] > 0:
-            blob = self.data
-            base = row["res_addr"]
-        else:
-            blob = self.overlay_raw_by_res_id.get(res_id)
-            base = 0
-        if blob is None or base >= len(blob):
+        blob, origin = self.resource_blob_for_res_id(res_id)
+        if blob is None or origin is None:
             self.geometry_cache[res_id] = None
             return None
-        materials, next_off = self._parse_mdl_material_list(blob, base)
+        materials, next_off = self._parse_mdl_material_list(blob, 0)
         groups = self._parse_groups(blob, next_off)
         self._assign_materials(materials, groups)
         vertices: list[tuple[float, float, float]] = []
@@ -465,7 +325,11 @@ class LVZArchive:
                         face = (base + index, base + index + 1, base + index + 2)
                     faces.append(face)
                     face_texture_res_ids.append(strip.material_res_index)
-        geometry = ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids) if faces else None
+        geometry = (
+            ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids, origin)
+            if faces
+            else None
+        )
         self.geometry_cache[res_id] = geometry
         return geometry
 
@@ -502,57 +366,137 @@ def export_streamed_archive(
     knackers_textures: dict[str, DecodedTexture] = {}
     exported_models = 0
     missing_res_ids = 0
+    no_resource_res_ids = 0
+    decode_failed_res_ids = 0
+    models_recovered_only_area = 0
+    models_recovered_only_interior = 0
+    models_recovered_only_swap = 0
+    models_recovered_via_area = 0
+    models_recovered_via_interior = 0
+    models_recovered_via_swap = 0
+    models_with_hidden_conflicts = 0
+    dff_failed_models = 0
 
     for model in plan.model_exports:
         if not model.placements:
             continue
         _log(
             f"[streamed] {archive_name} model {model.model_name}: "
-            f"{len(model.placements)} placements"
+            f"{len(model.placements)} resource candidates"
         )
-        base_inverse = matrix_inverse(model.placements[0].matrix)
+        visible_placements = [placement for placement in model.placements if placement.visible]
+        hidden_placements = [placement for placement in model.placements if not placement.visible]
+        placement_sets = [visible_placements or model.placements]
+        if visible_placements and hidden_placements:
+            placement_sets.append(hidden_placements)
+
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
         face_materials: list[str] = []
+        seen_fragments: set[tuple[int, int, int]] = set()
+        used_resource_origins: set[str] = set()
+        used_source_kinds: set[str] = set()
+        recovered_only_from_hidden = False
 
-        for placement in model.placements:
-            try:
-                geometry = archive.geometry_for_res_id(placement.res_id)
-            except Exception:
-                geometry = None
-            if geometry is None:
-                missing_res_ids += 1
-                continue
-            local_matrix = base_inverse @ np.asarray(placement.matrix, dtype=np.float64).reshape(4, 4)
-            base_index = len(vertices)
-            vertices.extend(transform_point(local_matrix, vertex) for vertex in geometry.vertices)
-            uvs.extend(geometry.uvs)
-            for face_index, (a, b, c) in enumerate(geometry.faces):
-                faces.append((base_index + a, base_index + b, base_index + c))
-                texture_res_id = geometry.face_texture_res_ids[face_index]
-                texture = archive.texture_for_res_id(texture_res_id)
-                texture_name = texture.name if texture is not None else f"{archive_name.lower()}_{texture_res_id}"
-                face_materials.append(texture_name)
-                if texture is not None and model.txd_name:
-                    txd_bucket = textures_by_txd.setdefault(model.txd_name, {})
-                    existing = txd_bucket.get(texture_name)
-                    txd_bucket[texture_name] = merge_texture(existing, texture) if existing else texture
-                    if model.txd_name.lower() == "knackers":
-                        existing_knackers = knackers_textures.get(texture_name)
-                        if existing_knackers is not None and existing_knackers.rgba != texture.rgba:
-                            report.knackers_texture_conflicts.append(
-                                f"{archive_name}: texture '{texture_name}' had conflicting data; kept higher-resolution copy"
-                            )
-                        knackers_textures[texture_name] = merge_texture(existing_knackers, texture) if existing_knackers else texture
+        base_matrix = (visible_placements or hidden_placements)[0].matrix
+        base_inverse = matrix_inverse(base_matrix)
+
+        for set_index, placements in enumerate(placement_sets):
+            fallback_mode = set_index > 0
+            before_faces = len(faces)
+            for placement in placements:
+                blob, _origin = archive.resource_blob_for_res_id(placement.res_id)
+                if blob is None:
+                    no_resource_res_ids += 1
+                    missing_res_ids += 1
+                    continue
+                try:
+                    geometry = archive.geometry_for_res_id(placement.res_id)
+                except Exception:
+                    geometry = None
+                if geometry is None:
+                    decode_failed_res_ids += 1
+                    missing_res_ids += 1
+                    continue
+                fragment_key = (placement.res_id, len(geometry.faces), len(geometry.vertices))
+                if fragment_key in seen_fragments:
+                    continue
+                seen_fragments.add(fragment_key)
+                local_matrix = base_inverse @ np.asarray(placement.matrix, dtype=np.float64).reshape(4, 4)
+                base_index = len(vertices)
+                vertices.extend(transform_point(local_matrix, vertex) for vertex in geometry.vertices)
+                uvs.extend(geometry.uvs)
+                used_resource_origins.add(geometry.resource_origin)
+                used_source_kinds.add(placement.source_kind)
+                for face_index, (a, b, c) in enumerate(geometry.faces):
+                    faces.append((base_index + a, base_index + b, base_index + c))
+                    texture_res_id = geometry.face_texture_res_ids[face_index]
+                    texture = archive.texture_for_res_id(texture_res_id)
+                    texture_name = texture.name if texture is not None else f"{archive_name.lower()}_{texture_res_id}"
+                    face_materials.append(texture_name)
+                    if texture is not None and model.txd_name:
+                        txd_bucket = textures_by_txd.setdefault(model.txd_name, {})
+                        existing = txd_bucket.get(texture_name)
+                        txd_bucket[texture_name] = merge_texture(existing, texture) if existing else texture
+                        if model.txd_name.lower() == "knackers":
+                            existing_knackers = knackers_textures.get(texture_name)
+                            if existing_knackers is not None and existing_knackers.rgba != texture.rgba:
+                                report.knackers_texture_conflicts.append(
+                                    f"{archive_name}: texture '{texture_name}' had conflicting data; kept higher-resolution copy"
+                                )
+                            knackers_textures[texture_name] = merge_texture(existing_knackers, texture) if existing_knackers else texture
+            if faces and fallback_mode:
+                recovered_only_from_hidden = True
+            if faces:
+                break
 
         if faces:
             mesh = MeshData(vertices=vertices, faces=faces, uvs=uvs, face_materials=face_materials)
             stem = sanitize_filename(model.model_name)
-            write_dff_from_mesh(mesh, archive_dir / f"{stem}.dff", stem)
-            write_col_from_mesh(mesh, archive_dir / f"{stem}.col", model_id=model.placements[0].res_id)
+            if not _mesh_vertices_finite(vertices):
+                dff_failed_models += 1
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: skipped DFF export for {model.model_name}: non-finite or extreme vertex coordinates"
+                )
+                continue
+            try:
+                write_dff_from_mesh(mesh, archive_dir / f"{stem}.dff", stem)
+            except Exception as exc:
+                dff_failed_models += 1
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: DFF export failed for {model.model_name}: {exc}"
+                )
+                continue
+            try:
+                write_col_from_mesh(mesh, archive_dir / f"{stem}.col", model_id=model.placements[0].res_id)
+            except Exception as exc:
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: collision export failed for {model.model_name}: {exc}"
+                )
             exported_models += 1
+            if model.has_hidden_alternates and visible_placements and hidden_placements:
+                models_with_hidden_conflicts += 1
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: kept default-visible fragments for {model.model_name}; hidden alternates were left as fallback"
+                )
+            if "area" in used_resource_origins:
+                models_recovered_via_area += 1
+            if used_source_kinds == {"interior"}:
+                models_recovered_only_interior += 1
+            elif "interior" in used_source_kinds:
+                models_recovered_via_interior += 1
+            if used_source_kinds == {"swap-sector"} or recovered_only_from_hidden:
+                models_recovered_only_swap += 1
+            elif "swap-sector" in used_source_kinds:
+                models_recovered_via_swap += 1
+            if used_resource_origins == {"area"}:
+                models_recovered_only_area += 1
             _log(f"[streamed] wrote {archive_name}/{stem}.dff + .col")
+        else:
+            report.streamed_diagnostics.append(
+                f"{archive_name}: no geometry decoded for {model.model_name} from {len(model.placements)} candidate resource ids"
+            )
 
     for txd_name, textures in textures_by_txd.items():
         if textures:
@@ -566,6 +510,28 @@ def export_streamed_archive(
     return {
         "exported_models": exported_models,
         "missing_res_ids": missing_res_ids,
+        "no_resource_res_ids": no_resource_res_ids,
+        "decode_failed_res_ids": decode_failed_res_ids,
+        "models_recovered_only_area": models_recovered_only_area,
+        "models_recovered_only_interior": models_recovered_only_interior,
+        "models_recovered_only_swap": models_recovered_only_swap,
+        "models_recovered_via_area": models_recovered_via_area,
+        "models_recovered_via_interior": models_recovered_via_interior,
+        "models_recovered_via_swap": models_recovered_via_swap,
+        "models_with_hidden_conflicts": models_with_hidden_conflicts,
+        "dff_failed_models": dff_failed_models,
         "exported_txds": sum(1 for textures in textures_by_txd.values() if textures),
-        "decoded_textures": len(archive.texture_by_res_id),
+        "decoded_textures": sum(1 for texture in archive.texture_cache.values() if texture is not None),
+        "loaded_master_resource_blobs": len(archive.master_raw_by_res_id),
+        "loaded_area_resource_blobs": len(archive.area_raw_by_res_id),
+        "loaded_overlay_resource_blobs": len(archive.overlay_raw_by_res_id),
     }
+
+
+def _mesh_vertices_finite(vertices: list[tuple[float, float, float]]) -> bool:
+    for x, y, z in vertices:
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            return False
+        if max(abs(x), abs(y), abs(z)) > 1e20:
+            return False
+    return True

@@ -38,14 +38,23 @@ class ReportData:
     unresolved_streamed_names: list[str] = field(default_factory=list)
     duplicate_pack_conflicts: list[str] = field(default_factory=list)
     knackers_texture_conflicts: list[str] = field(default_factory=list)
+    streamed_diagnostics: list[str] = field(default_factory=list)
+    ipl_diagnostics: list[str] = field(default_factory=list)
     missing_models: list[str] = field(default_factory=list)
+    missing_models_by_source_file: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class StreamedPlacement:
     ipl_id: int
+    world_id: int
     res_id: int
+    sector_id: int
+    pass_index: int
+    source_kind: str
+    visible: bool
     matrix: tuple[float, ...]
+    placement_count: int = 1
 
 
 @dataclass(slots=True)
@@ -55,6 +64,7 @@ class StreamedModelPlan:
     source_file: str
     placements: list[StreamedPlacement] = field(default_factory=list)
     unresolved_name: bool = False
+    has_hidden_alternates: bool = False
 
 
 @dataclass(slots=True)
