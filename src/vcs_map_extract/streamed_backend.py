@@ -84,6 +84,107 @@ class ParsedStreamedGeometry:
     resource_origin: str
 
 
+def _nearly_equal(a: float, b: float, eps: float = 1e-6) -> bool:
+    return abs(a - b) <= eps
+
+
+def _same_vertex(
+    a_pos: tuple[float, float, float],
+    b_pos: tuple[float, float, float],
+    a_uv: tuple[float, float] | None = None,
+    b_uv: tuple[float, float] | None = None,
+) -> bool:
+    if not (
+        _nearly_equal(a_pos[0], b_pos[0])
+        and _nearly_equal(a_pos[1], b_pos[1])
+        and _nearly_equal(a_pos[2], b_pos[2])
+    ):
+        return False
+    if a_uv is None or b_uv is None:
+        return True
+    return _nearly_equal(a_uv[0], b_uv[0]) and _nearly_equal(a_uv[1], b_uv[1])
+
+
+def _triangulate_strip_faces(
+    verts: list[tuple[float, float, float]],
+    *,
+    base_index: int = 0,
+    uvs: list[tuple[float, float]] | None = None,
+) -> list[tuple[int, int, int]]:
+    faces: list[tuple[int, int, int]] = []
+    strip_window: list[int] = []
+    winding = 0
+    for index, position in enumerate(verts):
+        uv = uvs[index] if uvs is not None and index < len(uvs) else None
+        if strip_window:
+            prev_index = strip_window[-1]
+            prev_uv = uvs[prev_index] if uvs is not None and prev_index < len(uvs) else None
+            if _same_vertex(verts[prev_index], position, prev_uv, uv):
+                strip_window = [index]
+                winding = 0
+                continue
+
+        strip_window.append(index)
+        if len(strip_window) < 3:
+            continue
+
+        a = strip_window[-3]
+        b = strip_window[-2]
+        c = strip_window[-1]
+        a_uv = uvs[a] if uvs is not None and a < len(uvs) else None
+        b_uv = uvs[b] if uvs is not None and b < len(uvs) else None
+        c_uv = uvs[c] if uvs is not None and c < len(uvs) else None
+        if _same_vertex(verts[a], verts[b], a_uv, b_uv) or _same_vertex(verts[b], verts[c], b_uv, c_uv) or _same_vertex(verts[a], verts[c], a_uv, c_uv):
+            strip_window = [b, c]
+            winding = 0
+            continue
+
+        if winding & 1:
+            faces.append((base_index + b, base_index + a, base_index + c))
+        else:
+            faces.append((base_index + a, base_index + b, base_index + c))
+        winding ^= 1
+    return faces
+
+
+def _iter_stitched_strip_runs(strips: list[TriStrip]) -> list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], int]]:
+    runs: list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], int]] = []
+    current_verts: list[tuple[float, float, float]] = []
+    current_uvs: list[tuple[float, float]] = []
+    current_material = -1
+
+    def flush() -> None:
+        nonlocal current_verts, current_uvs, current_material
+        if len(current_verts) >= 3:
+            runs.append((current_verts, current_uvs, current_material))
+        current_verts = []
+        current_uvs = []
+        current_material = -1
+
+    for strip in strips:
+        count = min(strip.count, len(strip.verts), len(strip.uvs))
+        if count <= 0:
+            continue
+        strip_verts = strip.verts[:count]
+        strip_uvs = strip.uvs[:count]
+        material = strip.material_res_index if strip.material_res_index >= 0 else -1
+        if not current_verts:
+            current_verts = list(strip_verts)
+            current_uvs = list(strip_uvs)
+            current_material = material
+            continue
+        if material != current_material:
+            flush()
+            current_verts = list(strip_verts)
+            current_uvs = list(strip_uvs)
+            current_material = material
+            continue
+        current_verts.extend(strip_verts)
+        current_uvs.extend(strip_uvs)
+    flush()
+    return runs
+
+
 class LVZArchive:
     def __init__(self, archive_name: str, lvz_path: Path, img_path: Path) -> None:
         self.archive_name = archive_name
@@ -343,23 +444,19 @@ class LVZArchive:
             groups = self._parse_groups(packet, 0)
             if not groups:
                 continue
+            packet_strips: list[TriStrip] = []
             for group in groups:
                 for strip in group.strips:
                     strip.material_res_index = mesh.texture_id
                     strip.uvs = [(u * mesh.u_scale, v * mesh.v_scale) for u, v in strip.uvs]
-                    count = min(strip.count, len(strip.verts), len(strip.uvs))
-                    if count < 3:
-                        continue
-                    base = len(vertices)
-                    vertices.extend(strip.verts[:count])
-                    uvs.extend(strip.uvs[:count])
-                    for index in range(count - 2):
-                        if index & 1:
-                            face = (base + index + 1, base + index, base + index + 2)
-                        else:
-                            face = (base + index, base + index + 1, base + index + 2)
-                        faces.append(face)
-                        face_texture_res_ids.append(mesh.texture_id)
+                    packet_strips.append(strip)
+            for strip_verts, strip_uvs, material_res_index in _iter_stitched_strip_runs(packet_strips):
+                base = len(vertices)
+                vertices.extend(strip_verts)
+                uvs.extend(strip_uvs)
+                for face in _triangulate_strip_faces(strip_verts, base_index=base, uvs=strip_uvs):
+                    faces.append(face)
+                    face_texture_res_ids.append(material_res_index)
 
         if not faces:
             return None
@@ -397,22 +494,14 @@ class LVZArchive:
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
         face_texture_res_ids: list[int] = []
-        for group in groups:
-            for strip in group.strips:
-                count = min(strip.count, len(strip.verts), len(strip.uvs))
-                if count < 3:
-                    continue
-                material_res_index = strip.material_res_index if strip.material_res_index >= 0 else -1
-                base = len(vertices)
-                vertices.extend(strip.verts[:count])
-                uvs.extend(strip.uvs[:count])
-                for index in range(count - 2):
-                    if index & 1:
-                        face = (base + index + 1, base + index, base + index + 2)
-                    else:
-                        face = (base + index, base + index + 1, base + index + 2)
-                    faces.append(face)
-                    face_texture_res_ids.append(material_res_index)
+        stitched_runs = _iter_stitched_strip_runs([strip for group in groups for strip in group.strips])
+        for strip_verts, strip_uvs, material_res_index in stitched_runs:
+            base = len(vertices)
+            vertices.extend(strip_verts)
+            uvs.extend(strip_uvs)
+            for face in _triangulate_strip_faces(strip_verts, base_index=base, uvs=strip_uvs):
+                faces.append(face)
+                face_texture_res_ids.append(material_res_index)
         if not faces:
             return None
         return ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids, origin)
@@ -458,12 +547,9 @@ class LVZArchive:
             batch_vertices = [self._read_vec3_i16_norm(blob, w + ((index + skip) * 6)) for index in range(count)]
             base = len(vertices)
             vertices.extend(batch_vertices)
-            uvs.extend([(0.0, 0.0)] * count)
-            for index in range(count - 2):
-                if index & 1:
-                    face = (base + index + 1, base + index, base + index + 2)
-                else:
-                    face = (base + index, base + index + 1, base + index + 2)
+            batch_uvs = [(0.0, 0.0)] * count
+            uvs.extend(batch_uvs)
+            for face in _triangulate_strip_faces(batch_vertices, base_index=base, uvs=batch_uvs):
                 faces.append(face)
                 face_texture_res_ids.append(-1)
 

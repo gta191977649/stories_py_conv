@@ -319,3 +319,10 @@ This prevents one corrupt streamed fragment from causing the whole model export 
 - `BEACH`, `MAINLA`, and `MALL` now use a pure-Python streamed exporter with world, interior, and area-resource loading.
 - Streamed neon/light resources are now handled as best-effort geometry too, including small wrapped transparent-pass blobs that only expose position strips.
 - Coverage is still best-effort: some streamed resources are malformed, unresolved, or too extreme for DragonFF mesh/collision writers, and those cases are recorded in `report.txt` instead of aborting the run.
+
+
+# Issues (TODO)
+* Model transform (Some model were rotated incorrectly, and transformed incorrectly in relation to their origin) based on ipl coordinate (perhaps is model convertion issue? wrong center origin?)
+* No Vertex color is ripped on model.
+* Incorrect TOBJ
+* Interior Obj is missing?
