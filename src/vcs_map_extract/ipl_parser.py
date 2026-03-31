@@ -2,6 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
+
+
+@dataclass(slots=True)
+class IplTransform:
+    model_id: int
+    model_name: str
+    interior: int
+    position: tuple[float, float, float]
+    rotation: tuple[float, float, float, float]
+    source_file: str
 
 
 @dataclass(slots=True)
@@ -17,6 +28,14 @@ class IplSummary:
     inst_count_by_file: dict[str, int] = field(default_factory=dict)
     nonzero_interior_by_file: dict[str, int] = field(default_factory=dict)
     nonzero_instances: list[IplInstance] = field(default_factory=list)
+    transforms_by_model: dict[str, list[IplTransform]] = field(default_factory=dict)
+
+
+def _parse_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def parse_ipl_directory(ipl_dir: Path) -> IplSummary:
@@ -51,7 +70,28 @@ def parse_ipl_directory(ipl_dir: Path) -> IplSummary:
             except ValueError:
                 continue
 
+            px = _parse_float(parts[3])
+            py = _parse_float(parts[4])
+            pz = _parse_float(parts[5])
+            rx = _parse_float(parts[9])
+            ry = _parse_float(parts[10])
+            rz = _parse_float(parts[11])
+            rw = _parse_float(parts[12])
+
             inst_count += 1
+            if None not in (px, py, pz, rx, ry, rz, rw):
+                rotation = (float(rx), float(ry), float(rz), float(rw))
+                if all(math.isfinite(value) for value in (*rotation, float(px), float(py), float(pz))):
+                    summary.transforms_by_model.setdefault(parts[1].lower(), []).append(
+                        IplTransform(
+                            model_id=instance_id,
+                            model_name=parts[1],
+                            interior=interior,
+                            position=(float(px), float(py), float(pz)),
+                            rotation=rotation,
+                            source_file=ipl_path.name,
+                        )
+                    )
             if interior != 0:
                 nonzero_count += 1
                 summary.nonzero_instances.append(

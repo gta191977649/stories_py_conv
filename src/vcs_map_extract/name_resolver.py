@@ -25,7 +25,15 @@ class NameResolver:
         return self.hash_to_ide_name.get(hash_value, f"hash_{hash_value:08X}")
 
     def resolve_streamed_model_name(self, world_id: int) -> str | None:
-        model_id = self.streamed_links.get(world_id)
-        if model_id is None:
+        link = self.streamed_links.get(world_id)
+        if link is None:
             return None
+        _linked_ipl_id, model_id = link
         return self.model_id_to_name.get(model_id)
+
+    def resolve_streamed_link(self, world_id: int) -> tuple[int, str | None] | None:
+        link = self.streamed_links.get(world_id)
+        if link is None:
+            return None
+        linked_ipl_id, model_id = link
+        return linked_ipl_id, self.model_id_to_name.get(model_id)

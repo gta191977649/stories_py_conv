@@ -24,9 +24,9 @@ def load_vcs_name_table() -> dict[int, str]:
 
 
 @lru_cache(maxsize=1)
-def load_streamed_link_table() -> dict[int, int]:
+def load_streamed_link_table() -> dict[int, tuple[int, int]]:
     path = REFERENCE_ROOT / "vcs_links.inc"
-    mapping: dict[int, int] = {}
-    for world_id_hex, _ipl_id_hex, model_id in LINK_ENTRY_RE.findall(_load_text(path)):
-        mapping[int(world_id_hex, 16)] = int(model_id, 10)
+    mapping: dict[int, tuple[int, int]] = {}
+    for world_id_hex, ipl_id_hex, model_id in LINK_ENTRY_RE.findall(_load_text(path)):
+        mapping[int(world_id_hex, 16)] = (int(ipl_id_hex, 16), int(model_id, 10))
     return mapping

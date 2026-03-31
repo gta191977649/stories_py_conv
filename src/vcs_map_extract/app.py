@@ -199,6 +199,7 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
                 plan,
                 report,
                 global_knackers_textures=global_knackers_textures,
+                ipl_summary=ipl_summary,
             )
             summary[archive_name].update(metrics)
             _log(
@@ -219,10 +220,21 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
     _ensure_knackers_txd(output_root)
 
     report.summary_by_archive = {name: dict(summary[name]) for name in ARCHIVE_ORDER}
+    exported_stems_by_archive = {
+        archive: {
+            path.stem
+            for path in (output_root / archive).glob("*.dff")
+        }
+        for archive in ARCHIVE_ORDER
+    }
     report.missing_models = sorted(
         model.model_name
         for model in ide_catalog.values()
-        if not any((output_root / archive / f"{sanitize_filename(model.model_name)}.dff").exists() for archive in ARCHIVE_ORDER)
+        if not any(
+            sanitize_filename(model.model_name) == stem or stem.startswith(f"{sanitize_filename(model.model_name)}__int_")
+            for archive in ARCHIVE_ORDER
+            for stem in exported_stems_by_archive[archive]
+        )
     )
     missing_by_source_file: dict[str, list[str]] = defaultdict(list)
     missing_lookup = set(report.missing_models)

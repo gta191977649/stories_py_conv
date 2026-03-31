@@ -322,6 +322,7 @@ This prevents one corrupt streamed fragment from causing the whole model export 
 
 
 # Issues (TODO)
+
 * Model transform (Some model were rotated incorrectly, and transformed incorrectly in relation to their origin) based on ipl coordinate (perhaps is model convertion issue? wrong center origin?)
 * No Vertex color is ripped on model.
 * Incorrect TOBJ

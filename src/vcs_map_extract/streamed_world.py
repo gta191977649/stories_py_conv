@@ -22,6 +22,10 @@ SECTOR_ENTRY_SIZE = 0x50
 WRLD_IDENT = 0x57524C44
 AREA_IDENT = 0x41524541
 MAX_REPORTED_UNRESOLVED = 128
+XINC = 125.0
+YINC = 108.25
+XSTART = -2400.0
+YSTART = -2000.0
 SOURCE_PRIORITY = {
     "world": 0,
     "interior": 1,
@@ -64,6 +68,25 @@ def _ptr_to_body_offset(raw_ptr: int) -> int:
 
 def _matrix_signature(values: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(round(float(value), 6) for value in values)
+
+
+def _world_sector_origin(secx: int, secy: int) -> tuple[float, float, float]:
+    return (
+        XSTART + (XINC / 2.0) + (XINC * secx) - ((secy & 1) * (XINC / 2.0)),
+        YSTART + (YINC / 2.0) + (YINC * secy),
+        0.0,
+    )
+
+
+def _matrix_with_origin(
+    values: tuple[float, ...],
+    origin: tuple[float, float, float],
+) -> tuple[float, ...]:
+    adjusted = list(values)
+    adjusted[12] += origin[0]
+    adjusted[13] += origin[1]
+    adjusted[14] += origin[2]
+    return tuple(adjusted)
 
 
 @dataclass(slots=True)
@@ -134,6 +157,8 @@ class SectorVisit:
     sector_id: int
     source_kind: str
     visible: bool
+    origin: tuple[float, float, float]
+    interior_chain: bool = False
 
 
 @dataclass(slots=True)
@@ -320,14 +345,30 @@ class LevelChunk:
 
         visits: dict[int, SectorVisit] = {}
         queue: deque[SectorVisit] = deque()
-        for sector_id in range(self.num_world_sectors):
-            queue.append(SectorVisit(sector_id=sector_id, source_kind="world", visible=True))
+        world_sector_id = 0
+        for secy in range(NUM_SECTOR_ROWS):
+            row_header_ptr, row_start_off = self.sector_rows[secy]
+            next_header_ptr = self.sector_rows[secy + 1][0] if secy + 1 < NUM_SECTOR_ROWS else self.sector_end_header_ptr
+            row_count = max(0, (next_header_ptr - row_header_ptr) // SECTOR_HEADER_STRUCT.size)
+            for index_in_row in range(row_count):
+                queue.append(
+                    SectorVisit(
+                        sector_id=world_sector_id,
+                        source_kind="world",
+                        visible=True,
+                        origin=_world_sector_origin(row_start_off + index_in_row, secy),
+                        interior_chain=False,
+                    )
+                )
+                world_sector_id += 1
         for interior in self.interiors:
             queue.append(
                 SectorVisit(
                     sector_id=interior.sector_id,
                     source_kind="interior",
                     visible=interior.default_visible(),
+                    origin=_world_sector_origin(interior.secx, interior.secy),
+                    interior_chain=True,
                 )
             )
 
@@ -338,6 +379,7 @@ class LevelChunk:
             existing = visits.get(visit.sector_id)
             if existing is not None:
                 existing.visible = existing.visible or visit.visible
+                existing.interior_chain = existing.interior_chain or visit.interior_chain
                 if SOURCE_PRIORITY[visit.source_kind] < SOURCE_PRIORITY[existing.source_kind]:
                     existing.source_kind = visit.source_kind
                 continue
@@ -350,6 +392,8 @@ class LevelChunk:
                         sector_id=swap.sector_id,
                         source_kind="swap-sector",
                         visible=swap.default_visible(),
+                        origin=visit.origin,
+                        interior_chain=visit.interior_chain,
                     )
                 )
 
@@ -438,13 +482,19 @@ def plan_streamed_archive(
     unique_ipl_ids: set[int] = set()
     unresolved_ids: set[int] = set()
     unresolved_names: list[str] = []
-    contributions_by_model: dict[str, dict[tuple[int, tuple[float, ...]], dict[int, StreamedPlacement]]] = defaultdict(
+    world_contributions: dict[str, dict[tuple[int, tuple[float, ...]], dict[int, StreamedPlacement]]] = defaultdict(
         lambda: defaultdict(dict)
     )
-    model_meta: dict[str, tuple[str, str]] = {}
+    world_model_meta: dict[str, tuple[str, str]] = {}
+    interior_contributions: dict[str, dict[tuple[object, ...], dict[int, StreamedPlacement]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    interior_model_meta: dict[str, tuple[str, str, str]] = {}
     txd_exports: dict[str, set[int]] = defaultdict(set)
     model_hidden_alternates: dict[str, bool] = defaultdict(bool)
     placement_attempts = 0
+    interior_instances_seen = 0
+    interior_sector_ids: set[int] = set()
 
     area_resource_count = 0
     for area in level.areas:
@@ -454,8 +504,14 @@ def plan_streamed_archive(
         total_rows += 1
         placement_attempts += 1
         unique_ipl_ids.add(instance.ipl_id)
-        model_name = resolver.resolve_streamed_model_name(instance.world_id)
-        if model_name is None:
+        is_interior_visit = getattr(visit, "interior_chain", visit.source_kind in {"interior", "swap-sector"})
+        if is_interior_visit:
+            interior_instances_seen += 1
+            interior_sector_ids.add(visit.sector_id)
+        link = resolver.resolve_streamed_link(instance.world_id)
+        model_name = link[1] if link is not None else None
+        linked_ipl_id = link[0] if link is not None else None
+        if model_name is None and not is_interior_visit:
             no_link_rows += 1
             if instance.world_id not in unresolved_ids and len(unresolved_ids) < MAX_REPORTED_UNRESOLVED:
                 unresolved_ids.add(instance.world_id)
@@ -465,39 +521,62 @@ def plan_streamed_archive(
                 )
             continue
 
-        linked_rows += 1
-        ide_model = ide_catalog.get(model_name.lower())
-        txd_name = ide_model.txd_name if ide_model is not None else ""
-        source_file = ide_model.source_file if ide_model is not None else f"{archive_name}.LVZ"
-        model_meta.setdefault(model_name, (txd_name, source_file))
-
+        absolute_matrix = _matrix_with_origin(instance.matrix, getattr(visit, "origin", (0.0, 0.0, 0.0)))
         placement = StreamedPlacement(
             ipl_id=instance.ipl_id,
+            linked_ipl_id=linked_ipl_id,
             world_id=instance.world_id,
             res_id=instance.res_id,
             sector_id=visit.sector_id,
             pass_index=pass_index,
             source_kind=visit.source_kind,
             visible=visit.visible,
-            matrix=instance.matrix,
+            matrix=absolute_matrix,
         )
-        if not visit.visible:
-            model_hidden_alternates[model_name] = True
-        cluster_key = (instance.ipl_id, _matrix_signature(instance.matrix))
-        cluster = contributions_by_model[model_name][cluster_key]
-        best = cluster.get(instance.res_id)
-        if best is None:
-            cluster[instance.res_id] = placement
-        else:
-            best.placement_count += 1
-            if _prefer_placement(placement, best):
-                placement.placement_count = best.placement_count
+        if model_name is not None:
+            linked_rows += 1
+            ide_model = ide_catalog.get(model_name.lower())
+            txd_name = ide_model.txd_name if ide_model is not None else ""
+            source_file = ide_model.source_file if ide_model is not None else f"{archive_name}.LVZ"
+            if not visit.visible:
+                model_hidden_alternates[model_name] = True
+            if is_interior_visit:
+                interior_model_meta.setdefault(model_name, (txd_name, source_file, "interior_named"))
+                cluster_key = (visit.sector_id, instance.res_id, visit.source_kind)
+                cluster = interior_contributions[model_name][cluster_key]
+            else:
+                world_model_meta.setdefault(model_name, (txd_name, source_file))
+                cluster_key = (
+                    linked_ipl_id if linked_ipl_id is not None else instance.ipl_id,
+                    _matrix_signature(absolute_matrix) if linked_ipl_id is None else (),
+                )
+                cluster = world_contributions[model_name][cluster_key]
+            best = cluster.get(instance.res_id)
+            if best is None:
                 cluster[instance.res_id] = placement
+            else:
+                best.placement_count += 1
+                if _prefer_placement(placement, best):
+                    placement.placement_count = best.placement_count
+                    cluster[instance.res_id] = placement
+        elif is_interior_visit:
+            fallback_name = f"interior_{archive_name.lower()}_{visit.sector_id}_{instance.res_id}"
+            interior_model_meta.setdefault(fallback_name, ("", f"{archive_name}.LVZ", "interior_fallback"))
+            cluster_key = (visit.sector_id, instance.res_id, visit.source_kind)
+            cluster = interior_contributions[fallback_name][cluster_key]
+            best = cluster.get(instance.res_id)
+            if best is None:
+                cluster[instance.res_id] = placement
+            else:
+                best.placement_count += 1
+                if _prefer_placement(placement, best):
+                    placement.placement_count = best.placement_count
+                    cluster[instance.res_id] = placement
 
     model_exports: list[StreamedModelPlan] = []
-    for model_name in sorted(contributions_by_model):
-        txd_name, source_file = model_meta[model_name]
-        clusters = contributions_by_model[model_name]
+    for model_name in sorted(world_contributions):
+        txd_name, source_file = world_model_meta[model_name]
+        clusters = world_contributions[model_name]
         cluster_items = sorted(
             clusters.items(),
             key=lambda item: _cluster_sort_key(item[1].values()),
@@ -515,17 +594,56 @@ def plan_streamed_archive(
         model_exports.append(
             StreamedModelPlan(
                 model_name=model_name,
+                output_name=model_name,
                 txd_name=txd_name,
                 source_file=source_file,
                 placements=placements,
                 unresolved_name=False,
                 has_hidden_alternates=model_hidden_alternates[model_name],
+                export_kind="world_named",
             )
         )
         if txd_name and txd_name.lower() != "null":
             txd_exports[txd_name].update(placement.res_id for placement in placements)
 
+    for model_name in sorted(interior_contributions):
+        txd_name, source_file, export_kind = interior_model_meta[model_name]
+        clusters = interior_contributions[model_name]
+        cluster_items = sorted(
+            clusters.items(),
+            key=lambda item: _cluster_sort_key(item[1].values()),
+        )
+        for cluster_index, (_cluster_key, cluster) in enumerate(cluster_items):
+            placements = sorted(
+                cluster.values(),
+                key=lambda item: (
+                    not item.visible,
+                    SOURCE_PRIORITY[item.source_kind],
+                    item.pass_index,
+                    item.sector_id,
+                    item.res_id,
+                ),
+            )
+            output_name = model_name
+            if export_kind == "interior_fallback" and cluster_index:
+                output_name = f"{model_name}_{cluster_index}"
+            model_exports.append(
+                StreamedModelPlan(
+                    model_name=model_name,
+                    output_name=output_name,
+                    txd_name=txd_name,
+                    source_file=source_file,
+                    placements=placements,
+                    unresolved_name=(export_kind == "interior_fallback"),
+                    has_hidden_alternates=any(not placement.visible for placement in placements),
+                    export_kind=export_kind,
+                )
+            )
+            if txd_name and txd_name.lower() != "null":
+                txd_exports[txd_name].update(placement.res_id for placement in placements)
+
     reachable = level.iter_reachable_sectors()
+    interior_export_plans = [model for model in model_exports if model.export_kind.startswith("interior")]
     summary = {
         "master_resources": level.num_resources,
         "world_sectors_loaded": level.num_world_sectors,
@@ -539,7 +657,12 @@ def plan_streamed_archive(
         "linked_rows": linked_rows,
         "no_link_rows": no_link_rows,
         "planned_models": len(model_exports),
-        "model_clusters": sum(len(clusters) for clusters in contributions_by_model.values()),
+        "planned_world_models": len([model for model in model_exports if model.export_kind == "world_named"]),
+        "planned_interior_models": len(interior_export_plans),
+        "planned_interior_fallbacks": len([model for model in interior_export_plans if model.export_kind == "interior_fallback"]),
+        "interior_sectors_scanned": len(interior_sector_ids),
+        "interior_instances_seen": interior_instances_seen,
+        "model_clusters": sum(len(clusters) for clusters in world_contributions.values()) + sum(len(clusters) for clusters in interior_contributions.values()),
         "planned_txds": len(txd_exports),
         "planned_res_ids": sum(len(model.placements) for model in model_exports),
         "unresolved_ids": len(unresolved_ids),

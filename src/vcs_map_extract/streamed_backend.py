@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from .models import ReportData, StreamedArchivePlan, StreamedPlacement
+from .ipl_parser import IplSummary, IplTransform
 from .pure_backend import DecodedTexture, MeshData, write_col_from_mesh, write_dff_from_mesh, write_txd_from_decoded_textures
+from .reference_data import load_vcs_name_table
 from .streamed_world import LevelChunk, parse_area_resource_table
 from .utils import sanitize_filename
 from .vendor.bleeds.tex import Ps2TexHeader, decode_ps2_texture, parse_ps2_header
@@ -18,6 +22,7 @@ UNPACK = 0x6C018000
 STMASK = 0x20000000
 STROW = 0x30000000
 MSCAL = 0x14000006
+TEXTURE_NAME_RE = re.compile(rb"[A-Za-z][A-Za-z0-9_.-]{2,31}")
 
 
 def _log(message: str) -> None:
@@ -192,8 +197,10 @@ class LVZArchive:
         self.master_raw_by_res_id = self._load_master_resources()
         self.area_raw_by_res_id = self._load_area_resources()
         self.overlay_raw_variants_by_res_id = self._load_sector_overlay_resources()
-        self.texture_cache: dict[int, DecodedTexture | None] = {}
+        self.texture_cache: dict[int, tuple[DecodedTexture | None, str]] = {}
         self.geometry_cache: dict[int, ParsedStreamedGeometry | None] = {}
+        self.known_hash_names = load_vcs_name_table()
+        self.known_names = {name.lower(): name for name in self.known_hash_names.values()}
 
     def _load_master_resources(self) -> dict[int, bytes]:
         pointers = self.level.read_master_resource_pointers()
@@ -244,12 +251,30 @@ class LVZArchive:
             return candidates[0]
         return None, None
 
-    def _decode_texture_blob(self, blob: bytes, res_id: int) -> DecodedTexture | None:
+    def _recover_texture_name(self, blob: bytes, res_id: int) -> tuple[str, str]:
+        known_names = getattr(self, "known_names", {})
+        known_hash_names = getattr(self, "known_hash_names", {})
+        for match in TEXTURE_NAME_RE.finditer(blob):
+            try:
+                candidate = match.group(0).decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            lowered = candidate.lower()
+            if lowered in known_names:
+                return known_names[lowered], "embedded"
+        scan_limit = min(len(blob), 0x80)
+        for offset in range(0, max(0, scan_limit - 3), 4):
+            hash_value = read_u32(blob, offset)
+            if hash_value in known_hash_names:
+                return known_hash_names[hash_value], "hash"
+        return f"{self.archive_name.lower()}_{res_id}", "synthetic"
+
+    def _decode_texture_blob(self, blob: bytes, res_id: int) -> tuple[DecodedTexture | None, str]:
         if len(blob) < 16:
-            return None
+            return None, "synthetic"
         parsed = parse_ps2_header((b"\x00" * 16) + blob, 16)
         if parsed is None:
-            return None
+            return None, "synthetic"
         header = Ps2TexHeader(
             reserved0=parsed.reserved0,
             reserved1=parsed.reserved1,
@@ -258,22 +283,24 @@ class LVZArchive:
         )
         rgba = decode_ps2_texture(blob, header, len(blob) - 16)
         if rgba is None:
-            return None
+            return None, "synthetic"
+        texture_name, naming_mode = self._recover_texture_name(blob, res_id)
         return DecodedTexture(
-            name=f"{self.archive_name.lower()}_{res_id}",
+            name=texture_name,
             rgba=rgba.astype(np.uint8).tobytes(),
             width=int(rgba.shape[1]),
             height=int(rgba.shape[0]),
-        )
+        ), naming_mode
 
-    def texture_for_res_id(self, res_id: int) -> DecodedTexture | None:
+    def texture_for_res_id(self, res_id: int) -> tuple[DecodedTexture | None, str]:
         if res_id not in self.texture_cache:
             decoded = None
+            naming_mode = "synthetic"
             for blob, _origin in self.resource_blobs_for_res_id(res_id):
-                decoded = self._decode_texture_blob(blob, res_id)
+                decoded, naming_mode = self._decode_texture_blob(blob, res_id)
                 if decoded is not None:
                     break
-            self.texture_cache[res_id] = decoded
+            self.texture_cache[res_id] = (decoded, naming_mode)
         return self.texture_cache[res_id]
 
     def _find_unpack_near(self, blob: bytes, offset: int, window: int = 8) -> int:
@@ -616,6 +643,91 @@ def translation_inverse(values: tuple[float, ...]) -> np.ndarray:
     return matrix
 
 
+def _normalize_vector(vector: np.ndarray) -> np.ndarray:
+    length = float(np.linalg.norm(vector))
+    if not math.isfinite(length) or length <= 1e-8:
+        raise ValueError("Degenerate basis vector")
+    return vector / length
+
+
+def rotation_translation_inverse(values: tuple[float, ...]) -> np.ndarray:
+    world = rw_matrix(values)
+    linear = world[:3, :3]
+
+    right = _normalize_vector(linear[:, 0])
+    up = linear[:, 1] - (np.dot(linear[:, 1], right) * right)
+    up = _normalize_vector(up)
+    at = np.cross(right, up)
+    if np.dot(at, linear[:, 2]) < 0.0:
+        at = -at
+    at = _normalize_vector(at)
+
+    rotation = np.column_stack((right, up, at))
+    inverse = np.identity(4, dtype=np.float64)
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -(rotation.T @ world[:3, 3])
+    return inverse
+
+
+def _quaternion_matrix(rotation: tuple[float, float, float, float]) -> np.ndarray:
+    x, y, z, w = rotation
+    length = math.sqrt(x * x + y * y + z * z + w * w)
+    if not math.isfinite(length) or length <= 1e-8:
+        raise ValueError("Degenerate quaternion")
+    x /= length
+    y /= length
+    z /= length
+    w /= length
+    matrix = np.identity(4, dtype=np.float64)
+    matrix[0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrix[0, 1] = 2.0 * (x * y - z * w)
+    matrix[0, 2] = 2.0 * (x * z + y * w)
+    matrix[1, 0] = 2.0 * (x * y + z * w)
+    matrix[1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrix[1, 2] = 2.0 * (y * z - x * w)
+    matrix[2, 0] = 2.0 * (x * z - y * w)
+    matrix[2, 1] = 2.0 * (y * z + x * w)
+    matrix[2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return matrix
+
+
+def _ipl_matrix(transform: IplTransform) -> np.ndarray:
+    matrix = _quaternion_matrix(transform.rotation)
+    matrix[0, 3] = transform.position[0]
+    matrix[1, 3] = transform.position[1]
+    matrix[2, 3] = transform.position[2]
+    return matrix
+
+
+def _placement_translation(values: tuple[float, ...]) -> tuple[float, float, float]:
+    matrix = rw_matrix(values)
+    return (float(matrix[0, 3]), float(matrix[1, 3]), float(matrix[2, 3]))
+
+
+def _find_nearest_ipl_transform(
+    model_name: str,
+    placements: list[StreamedPlacement],
+    ipl_summary: IplSummary | None,
+) -> IplTransform | None:
+    if ipl_summary is None:
+        return None
+    candidates = ipl_summary.transforms_by_model.get(model_name.lower(), [])
+    if not candidates:
+        return None
+    anchor = _placement_translation(placements[0].matrix)
+    best: IplTransform | None = None
+    best_dist = float("inf")
+    for candidate in candidates:
+        dx = candidate.position[0] - anchor[0]
+        dy = candidate.position[1] - anchor[1]
+        dz = candidate.position[2] - anchor[2]
+        dist = dx * dx + dy * dy + dz * dz
+        if dist < best_dist:
+            best_dist = dist
+            best = candidate
+    return best
+
+
 def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarray, StreamedPlacement | None]:
     best_transform: np.ndarray | None = None
     best_placement: StreamedPlacement | None = None
@@ -629,8 +741,11 @@ def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarr
             continue
         if score > best_score:
             best_score = score
-            best_transform = translation_inverse(placement.matrix)
-            best_placement = placement
+            try:
+                best_transform = rotation_translation_inverse(placement.matrix)
+                best_placement = placement
+            except ValueError:
+                continue
     if best_transform is not None:
         return best_transform, best_placement
     return np.identity(4, dtype=np.float64), None
@@ -642,6 +757,29 @@ def merge_texture(existing: DecodedTexture, incoming: DecodedTexture) -> Decoded
     return existing
 
 
+def _geometry_signature(fragment_keys: set[tuple[int, int, int]]) -> str:
+    digest = hashlib.sha1()
+    for fragment_key in sorted(fragment_keys):
+        digest.update(repr(fragment_key).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _unique_stem(preferred: str, used_stems: set[str], fallback_suffix: str = "") -> str:
+    stem = sanitize_filename(preferred)
+    if stem not in used_stems:
+        return stem
+    if fallback_suffix:
+        candidate = sanitize_filename(f"{preferred}{fallback_suffix}")
+        if candidate not in used_stems:
+            return candidate
+    index = 1
+    while True:
+        candidate = sanitize_filename(f"{preferred}_{index}")
+        if candidate not in used_stems:
+            return candidate
+        index += 1
+
+
 def export_streamed_archive(
     archive_name: str,
     root: Path,
@@ -649,6 +787,7 @@ def export_streamed_archive(
     plan: StreamedArchivePlan,
     report: ReportData,
     global_knackers_textures: dict[str, DecodedTexture] | None = None,
+    ipl_summary: IplSummary | None = None,
 ) -> dict[str, int]:
     _log(f"[streamed] load {archive_name}.LVZ")
     archive = LVZArchive(archive_name, root / f"{archive_name}.LVZ", root / f"{archive_name}.IMG")
@@ -671,12 +810,21 @@ def export_streamed_archive(
     dff_failed_models = 0
     skipped_bad_fragments = 0
     salvaged_models = 0
+    interior_models_exported = 0
+    interior_named_exports = 0
+    interior_fallback_exports = 0
+    interior_variant_exports = 0
+    interior_texture_names_recovered_ids: set[int] = set()
+    interior_texture_names_fallback_ids: set[int] = set()
+    exported_signatures_by_name: dict[str, set[str]] = {}
+    used_output_stems: set[str] = set()
 
     for model in plan.model_exports:
         if not model.placements:
             continue
+        diagnostics = report.interior_diagnostics if model.export_kind.startswith("interior") else report.streamed_diagnostics
         _log(
-            f"[streamed] {archive_name} model {model.model_name}: "
+            f"[streamed] {archive_name} model {model.output_name}: "
             f"{len(model.placements)} resource candidates"
         )
         visible_placements = [placement for placement in model.placements if placement.visible]
@@ -695,20 +843,31 @@ def export_streamed_archive(
         recovered_only_from_hidden = False
         bad_fragments_for_model = 0
 
+        localize_inverse: np.ndarray
         base_inverse, base_placement = choose_base_transform(visible_placements or hidden_placements)
-        if base_placement is None:
-            report.streamed_diagnostics.append(
-                f"{archive_name}: all placement matrices for {model.model_name} were degenerate; used identity fallback"
+        matched_ipl = None
+        if model.export_kind == "world_named":
+            matched_ipl = _find_nearest_ipl_transform(model.model_name, visible_placements or hidden_placements, ipl_summary)
+        if matched_ipl is not None:
+            localize_inverse = np.linalg.inv(_ipl_matrix(matched_ipl))
+            diagnostics.append(
+                f"{archive_name}: localized {model.output_name} against IPL transform from {matched_ipl.source_file} "
+                f"at ({matched_ipl.position[0]:.3f}, {matched_ipl.position[1]:.3f}, {matched_ipl.position[2]:.3f})"
             )
-        elif base_placement is not (visible_placements or hidden_placements)[0]:
-            report.streamed_diagnostics.append(
-                f"{archive_name}: skipped degenerate base placement for {model.model_name}; "
-                f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
-            )
+        else:
+            localize_inverse = base_inverse
+            if base_placement is None:
+                diagnostics.append(
+                    f"{archive_name}: all placement matrices for {model.output_name} were degenerate; used identity fallback"
+                )
+            elif base_placement is not (visible_placements or hidden_placements)[0]:
+                diagnostics.append(
+                    f"{archive_name}: skipped degenerate base placement for {model.output_name}; "
+                    f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
+                )
 
         for set_index, placements in enumerate(placement_sets):
             fallback_mode = set_index > 0
-            before_faces = len(faces)
             for placement in placements:
                 blob, _origin = archive.resource_blob_for_res_id(placement.res_id)
                 if blob is None:
@@ -727,13 +886,13 @@ def export_streamed_archive(
                 if fragment_key in seen_fragments:
                     continue
                 seen_fragments.add(fragment_key)
-                local_matrix = base_inverse @ rw_matrix(placement.matrix)
+                local_matrix = localize_inverse @ rw_matrix(placement.matrix)
                 transformed_vertices = [transform_point(local_matrix, vertex) for vertex in geometry.vertices]
                 if not _fragment_vertices_valid(transformed_vertices):
                     skipped_bad_fragments += 1
                     bad_fragments_for_model += 1
-                    report.streamed_diagnostics.append(
-                        f"{archive_name}: skipped corrupt fragment for {model.model_name} "
+                    diagnostics.append(
+                        f"{archive_name}: skipped corrupt fragment for {model.output_name} "
                         f"(res_id={placement.res_id}, sector={placement.sector_id}, pass={placement.pass_index}, "
                         f"source={placement.source_kind})"
                     )
@@ -746,14 +905,26 @@ def export_streamed_archive(
                 for face_index, (a, b, c) in enumerate(geometry.faces):
                     faces.append((base_index + a, base_index + b, base_index + c))
                     texture_res_id = geometry.face_texture_res_ids[face_index]
-                    texture = archive.texture_for_res_id(texture_res_id) if texture_res_id >= 0 else None
+                    texture, naming_mode = archive.texture_for_res_id(texture_res_id) if texture_res_id >= 0 else (None, "synthetic")
                     texture_name = texture.name if texture is not None else ""
                     face_materials.append(texture_name)
-                    if texture is not None and model.txd_name:
-                        txd_bucket = textures_by_txd.setdefault(model.txd_name, {})
+                    if model.export_kind.startswith("interior") and texture_res_id >= 0:
+                        if texture is not None and naming_mode != "synthetic":
+                            interior_texture_names_recovered_ids.add(texture_res_id)
+                        else:
+                            interior_texture_names_fallback_ids.add(texture_res_id)
+                    effective_txd_name = model.txd_name
+                    if not effective_txd_name and model.export_kind == "interior_fallback":
+                        effective_txd_name = "interior_generic"
+                    if texture is not None and effective_txd_name:
+                        txd_bucket = textures_by_txd.setdefault(effective_txd_name, {})
                         existing = txd_bucket.get(texture_name)
+                        if existing is not None and existing.rgba != texture.rgba:
+                            report.streamed_texture_conflicts.append(
+                                f"{archive_name}: texture '{texture_name}' had conflicting data in {effective_txd_name}; kept higher-resolution copy"
+                            )
                         txd_bucket[texture_name] = merge_texture(existing, texture) if existing else texture
-                        if model.txd_name.lower() == "knackers":
+                        if effective_txd_name.lower() == "knackers":
                             existing_knackers = knackers_textures.get(texture_name)
                             if existing_knackers is not None and existing_knackers.rgba != texture.rgba:
                                 report.knackers_texture_conflicts.append(
@@ -767,37 +938,76 @@ def export_streamed_archive(
 
         if faces:
             mesh = MeshData(vertices=vertices, faces=faces, uvs=uvs, face_materials=face_materials)
-            stem = sanitize_filename(model.model_name)
+            base_stem = sanitize_filename(model.output_name or model.model_name)
+            export_signature = _geometry_signature(seen_fragments)
+            output_stem = base_stem
+            existing_signatures = exported_signatures_by_name.setdefault(base_stem, set())
+            if model.export_kind == "interior_named":
+                if export_signature in existing_signatures:
+                    diagnostics.append(
+                        f"{archive_name}: skipped duplicate interior export for {model.model_name}; identical geometry already exported"
+                    )
+                    continue
+                if base_stem in used_output_stems:
+                    variant_name = f"{model.model_name}__int_{model.placements[0].sector_id}"
+                    output_stem = _unique_stem(variant_name, used_output_stems, fallback_suffix=f"_r{model.placements[0].res_id}")
+                    interior_variant_exports += 1
+                    diagnostics.append(
+                        f"{archive_name}: wrote interior variant {output_stem} for {model.model_name} due to world/interior geometry mismatch"
+                    )
+                else:
+                    interior_named_exports += 1
+            elif model.export_kind == "interior_fallback":
+                output_stem = _unique_stem(model.output_name or model.model_name, used_output_stems, fallback_suffix=f"_r{model.placements[0].res_id}")
+                interior_fallback_exports += 1
+                diagnostics.append(
+                    f"{archive_name}: exported fallback interior model {output_stem} from sector={model.placements[0].sector_id}, res_id={model.placements[0].res_id}"
+                )
+            else:
+                if export_signature in existing_signatures:
+                    diagnostics.append(
+                        f"{archive_name}: skipped duplicate world export for {model.model_name}; identical geometry already exported"
+                    )
+                    continue
+                output_stem = _unique_stem(base_stem, used_output_stems)
             if not _mesh_vertices_finite(vertices):
                 dff_failed_models += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: skipped DFF export for {model.model_name}: non-finite or extreme vertex coordinates"
+                diagnostics.append(
+                    f"{archive_name}: skipped DFF export for {model.output_name}: non-finite or extreme vertex coordinates"
                 )
                 continue
             if bad_fragments_for_model:
                 salvaged_models += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: salvaged {model.model_name} after dropping {bad_fragments_for_model} corrupt fragment(s)"
+                diagnostics.append(
+                    f"{archive_name}: salvaged {model.output_name} after dropping {bad_fragments_for_model} corrupt fragment(s)"
                 )
             try:
-                write_dff_from_mesh(mesh, archive_dir / f"{stem}.dff", stem)
+                write_dff_from_mesh(mesh, archive_dir / f"{output_stem}.dff", output_stem)
             except Exception as exc:
                 dff_failed_models += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: DFF export failed for {model.model_name}: {exc}"
+                diagnostics.append(
+                    f"{archive_name}: DFF export failed for {model.output_name}: {exc}"
                 )
                 continue
             try:
-                write_col_from_mesh(mesh, archive_dir / f"{stem}.col", model_id=model.placements[0].res_id)
+                write_col_from_mesh(mesh, archive_dir / f"{output_stem}.col", model_id=model.placements[0].res_id)
             except Exception as exc:
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: collision export failed for {model.model_name}: {exc}"
+                diagnostics.append(
+                    f"{archive_name}: collision export failed for {model.output_name}: {exc}"
                 )
             exported_models += 1
+            used_output_stems.add(output_stem)
+            existing_signatures.add(export_signature)
+            if model.export_kind.startswith("interior"):
+                interior_models_exported += 1
+                if not model.txd_name and any(face_materials):
+                    diagnostics.append(
+                        f"{archive_name}: mapped {output_stem} textures into interior_generic.txd due to missing IDE TXD name"
+                    )
             if model.has_hidden_alternates and visible_placements and hidden_placements:
                 models_with_hidden_conflicts += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: kept default-visible fragments for {model.model_name}; hidden alternates were left as fallback"
+                diagnostics.append(
+                    f"{archive_name}: kept default-visible fragments for {model.output_name}; hidden alternates were left as fallback"
                 )
             if "area" in used_resource_origins:
                 models_recovered_via_area += 1
@@ -811,10 +1021,10 @@ def export_streamed_archive(
                 models_recovered_via_swap += 1
             if used_resource_origins == {"area"}:
                 models_recovered_only_area += 1
-            _log(f"[streamed] wrote {archive_name}/{stem}.dff + .col")
+            _log(f"[streamed] wrote {archive_name}/{output_stem}.dff + .col")
         else:
-            report.streamed_diagnostics.append(
-                f"{archive_name}: no geometry decoded for {model.model_name} from {len(model.placements)} candidate resource ids"
+            diagnostics.append(
+                f"{archive_name}: no geometry decoded for {model.output_name} from {len(model.placements)} candidate resource ids"
             )
 
     for txd_name, textures in textures_by_txd.items():
@@ -843,8 +1053,14 @@ def export_streamed_archive(
         "dff_failed_models": dff_failed_models,
         "skipped_bad_fragments": skipped_bad_fragments,
         "salvaged_models": salvaged_models,
+        "interior_models_exported": interior_models_exported,
+        "interior_named_exports": interior_named_exports,
+        "interior_fallback_exports": interior_fallback_exports,
+        "interior_variant_exports": interior_variant_exports,
+        "interior_texture_names_recovered": len(interior_texture_names_recovered_ids),
+        "interior_texture_names_fallback": len(interior_texture_names_fallback_ids),
         "exported_txds": sum(1 for txd_name, textures in textures_by_txd.items() if textures and txd_name.lower() != "knackers"),
-        "decoded_textures": sum(1 for texture in archive.texture_cache.values() if texture is not None),
+        "decoded_textures": sum(1 for texture, _naming_mode in archive.texture_cache.values() if texture is not None),
         "loaded_master_resource_blobs": len(archive.master_raw_by_res_id),
         "loaded_area_resource_blobs": len(archive.area_raw_by_res_id),
         "loaded_overlay_resource_blobs": len(archive.overlay_raw_variants_by_res_id),
