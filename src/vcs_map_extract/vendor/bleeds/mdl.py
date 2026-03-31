@@ -607,10 +607,9 @@ def read_ps2_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesGeomet
     ctx.log("Detected Section Type: 3 (Geometry, PS2)")
 
     f.seek(geom_ptr)
-
     g.materials = read_material_list(ctx, f)
 
-    for i in range(13):
+    for _ in range(13):
         f.read(4)
     ctx.log("✔ Skipped 13 DWORDs")
 
@@ -625,553 +624,266 @@ def read_ps2_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesGeomet
     ctx.log(f"🟧 zScale is at file offset: 0x{zscale_offset - 4:X}")
     ctx.log(f"✔ xScale: {g.x_scale}, yScale: {g.y_scale}, zScale: {g.z_scale}")
 
-    scale_factor = 100.0
-    global_scale = scale_factor * 0.00000030518203134641490805874367518203
+    global_scale = 100.0 * 0.00000030518203134641490805874367518203
 
     offset_x = f.tell()
-    tx = read_f32(f) * scale_factor / 100.0
+    tx = read_f32(f)
     ctx.log(f"✔ TranslationFactor X read at file offset: 0x{offset_x:X} ({offset_x})")
-
     offset_y = f.tell()
-    ty = read_f32(f) * scale_factor / 100.0
+    ty = read_f32(f)
     ctx.log(f"✔ TranslationFactor Y read at file offset: 0x{offset_y:X} ({offset_y})")
-
     offset_z = f.tell()
-    tz = read_f32(f) * scale_factor / 100.0
+    tz = read_f32(f)
     ctx.log(f"✔ TranslationFactor Z read at file offset: 0x{offset_z:X} ({offset_z})")
-
     g.translation = (tx, ty, tz)
     ctx.log(f"✔ TranslationFactor: {g.translation}")
 
-    part_offsets: List[int] = []
-    part_material_ids: List[int] = []
+    file_pos = f.tell()
+    f.seek(0, 0)
+    data = f.read()
+    f.seek(file_pos, 0)
 
-    part_table_seek = f.tell()
+    def read_u16_at(offset: int) -> int:
+        return struct.unpack_from("<H", data, offset)[0]
 
-    prop_offsets_from_table = None
-    prop_geo_start = None
+    def read_i16_at(offset: int) -> int:
+        return struct.unpack_from("<h", data, offset)[0]
 
-    peek_bytes = f.read(4)
-    marker_val = struct.unpack_from("<I", peek_bytes)[0] if len(peek_bytes) == 4 else 0
+    def read_u32_at(offset: int) -> int:
+        return struct.unpack_from("<I", data, offset)[0]
 
-    mdl_type_u = (str(getattr(ctx, "mdl_type", "") or "")).upper().strip()
+    def read_i32_at(offset: int) -> int:
+        return struct.unpack_from("<i", data, offset)[0]
 
-    if (marker_val & 0xFF000000) == 0x60000000:
-        has_part_table = False
+    def read_f32_at(offset: int) -> float:
+        return struct.unpack_from("<f", data, offset)[0]
 
-    elif mdl_type_u == "PED":
-        has_part_table = True
+    def unpack_size(unpack: int) -> int:
+        if (unpack & 0x6F000000) == 0x6F000000:
+            return 2
+        size = (32, 16, 8, 16)
+        return (((unpack >> 26) & 3) + 1) * size[(unpack >> 24) & 3] // 8
 
-    else:
-        part_count_hint = len(g.materials) if g.materials else 0
-        has_part_table = True  
+    def skip_unpack(offset: int) -> int:
+        count = (read_u32_at(offset) >> 16) & 0xFF
+        return offset + ((((count * unpack_size(read_u32_at(offset))) + 3) >> 2) + 1) * 4
 
-        if part_count_hint > 0:
-            f.seek(part_table_seek)
-            offs = [read_u32(f) for _ in range(part_count_hint)]
+    res_header_base = xscale_offset - 0x28
+    res_size = read_u32_at(res_header_base + 0x10)
+    res_flags = read_i32_at(res_header_base + 0x14)
+    dma_offset = read_u16_at(res_header_base + 0x1A)
+    num_meshes = res_size >> 20
+    mesh_table_base = res_header_base + 0x40
+    geo_start = res_header_base + dma_offset
 
-            monotonic = (offs[0] == 0) and all(offs[i] <= offs[i + 1] for i in range(len(offs) - 1))
-            sane = all(o < 0x400000 for o in offs)
+    if num_meshes <= 0 or num_meshes > 0x400:
+        raise Exception(f"Unexpected PS2 mesh count: {num_meshes}")
 
-            found_dma = None
-            scan_base = part_table_seek
-            max_scan = 0x800  
-            for i in range(0, max_scan, 4):
-                f.seek(scan_base + i)
-                buf = f.read(4)
-                if len(buf) < 4:
-                    break
-                v = struct.unpack_from("<I", buf)[0]
-                if (v & 0xFF000000) == 0x60000000:
-                    found_dma = scan_base + i
-                    break
-
-            if monotonic and sane and found_dma is not None:
-                has_part_table = False
-                prop_offsets_from_table = offs
-                prop_geo_start = found_dma
-
-    f.seek(part_table_seek)
-
-
-    if has_part_table:
-        ctx.log("✔ Detected explicit part table (ped/clump). Reading part offsets...")
-        temp = read_u32(f)
-        while True:
-            if (temp & 0x60000000) == 0x60000000:
-                break
-            for _ in range(6):
-                f.read(4)
-            temp_offset = read_u32(f)
-            part_offsets.append(temp_offset)
-            _short1 = read_u16(f)
-            temp_mat = read_u16(f)
-            part_material_ids.append(temp_mat)
-            f.read(4)
-            f.read(4)
-            f.read(4)
-            temp = read_u32(f)
-        f.seek(-4, 1)
-        geo_start = f.tell()
-        g.part_offsets = part_offsets
-        g.part_material_ids = part_material_ids
-        ctx.log(f"✔ partOffsets: {part_offsets}")
-        ctx.log(f"✔ partMaterials: {part_material_ids}")
-        ctx.log(f"geoStart: 0x{geo_start:X}")
-    else:
-        if prop_offsets_from_table is not None and prop_geo_start is not None:
-            part_offsets = list(prop_offsets_from_table)
-            part_material_ids = list(range(len(part_offsets)))
-            geo_start = int(prop_geo_start)
-
-            g.part_offsets = part_offsets
-            g.part_material_ids = part_material_ids
-
-            ctx.log("✔ Detected prop offset table (u32 offsets).")
-            ctx.log(f"✔ partOffsets: {part_offsets}")
-            ctx.log(f"✔ partMaterials: {part_material_ids}")
-            ctx.log(f"geoStart: 0x{geo_start:X}")
-
-            f.seek(geo_start, 0)
-        else:
-            part_count = len(g.materials) if g.materials else 0
-            scan_base = f.tell()
-            initial_offset = 0
-            found = False
-            search_limit = 0x100
-            for i in range(search_limit):
-                f.seek(scan_base + i)
-                buf = f.read(4)
-                if len(buf) < 4:
-                    break
-                marker_val = struct.unpack_from("<I", buf)[0]
-                if (marker_val & 0xFF000000) == 0x60000000:
-                    initial_offset = i
-                    found = True
-                    break
-            if found:
-                dma_tag_pos = scan_base + initial_offset
-                geo_start_tmp = dma_tag_pos - 4
-                offset_acc = 4
-                for p in range(part_count):
-                    part_offsets.append(offset_acc)
-                    part_material_ids.append(p)
-                    f.seek(geo_start_tmp + offset_acc)
-                    tag_buf = f.read(4)
-                    if len(tag_buf) < 4:
-                        break
-                    tag_val = struct.unpack_from("<I", tag_buf)[0]
-                    qwc = tag_val & 0xFFFF
-                    seg_size = (qwc * 16) + 16
-                    offset_acc += seg_size
-            else:
-                for p in range(part_count):
-                    part_offsets.append(0)
-                    part_material_ids.append(p)
-            dma_tag_pos = scan_base + initial_offset
-            geo_start = dma_tag_pos - 4
-            f.seek(geo_start, 0)
-            g.part_offsets = part_offsets
-            g.part_material_ids = part_material_ids
-            ctx.log(f"✔ partOffsets: {part_offsets}")
-            ctx.log(f"✔ partMaterials: {part_material_ids}")
-            ctx.log(f"geoStart: 0x{geo_start:X}")
-    
-        if g.part_offsets:
-            ctx.log("====== Geometry dmaPacket Offsets ======")
-            for i, po in enumerate(g.part_offsets):
-                ctx.log(f"Part {i + 1}: dmaPacket offset 0x{(geo_start + po):X}")
-            ctx.log("===================================")
-    
-
-    def scan_for_vif_header(
-        *,
-        start: int,
-        end: int,
-        wanted_cmd: int,
-        max_scan_bytes: int = 0x200,
-        step: int = 4,
-        require_b1_80: bool = True,
-    ) -> Optional[Tuple[int, bytes]]:
-        if end < start:
-            return None
-        scan_end = min(end, start + max_scan_bytes)
-        pos = start
-        while pos + 4 <= scan_end:
-            f.seek(pos, 0)
-            hdr = f.read(4)
-            if len(hdr) < 4:
-                return None
-            b0, b1, b2, b3 = hdr[0], hdr[1], hdr[2], hdr[3]
-            if require_b1_80 and b1 != 0x80:
-                pos += step
-                continue
-            if b3 == wanted_cmd:
-                return pos, hdr
-            pos += step
-        return None
-
-    for part_index, part_offset in enumerate(part_offsets):
-        part_addr = geo_start + part_offset
-
-        part = StoriesPartGeom()
-        part.material_id = int(part_material_ids[part_index])
-
-        if part_index + 1 < len(part_offsets):
-            next_part_addr = geo_start + part_offsets[part_index + 1]
-        else:
-            f.seek(0, 2)
-            next_part_addr = f.tell()
-
-        f.seek(part_addr)
-        ctx.log(
-            f"\n🔄 Reading geometry dmaOffset {part_index + 1}/{len(part_offsets)} (Offset: 0x{part_addr:X})"
+    part_defs: List[Dict[str, Any]] = []
+    for mesh_index in range(num_meshes):
+        mesh_off = mesh_table_base + (mesh_index * 0x30)
+        if mesh_off + 0x30 > len(data):
+            raise Exception(f"PS2 mesh descriptor truncated at 0x{mesh_off:X}")
+        part_defs.append(
+            {
+                "dma_packet": read_u32_at(mesh_off + 0x1C),
+                "num_triangles": read_u16_at(mesh_off + 0x20),
+                "mat_id": struct.unpack_from("<h", data, mesh_off + 0x22)[0],
+                "uv_scale": (read_f32_at(mesh_off + 0x10), read_f32_at(mesh_off + 0x14)),
+            }
         )
 
-        while f.tell() < next_part_addr:
-            marker_seek = f.tell()
-            ctx.log(f"🔎 Looking for triangle strip marker at offset: 0x{marker_seek:X}")
+    g.part_offsets = [int(part_def["dma_packet"]) for part_def in part_defs]
+    g.part_material_ids = [int(part_def["mat_id"]) for part_def in part_defs]
+    ctx.log("✔ Parsed PS2 mesh descriptors from Stories geometry header.")
+    ctx.log(f"✔ partOffsets: {g.part_offsets}")
+    ctx.log(f"✔ partMaterials: {g.part_material_ids}")
+    ctx.log(f"geoStart: 0x{geo_start:X}")
+    ctx.log("====== Geometry dmaPacket Offsets ======")
+    for index, offset in enumerate(g.part_offsets):
+        ctx.log(f"Part {index + 1}: dmaPacket offset 0x{(geo_start + offset):X}")
+    ctx.log("===================================")
 
-            marker = read_u32(f)
-            ctx.log(f"   Read marker 0x{marker:08X} at 0x{marker_seek:X}")
+    for part_index, part_def in enumerate(part_defs):
+        part_addr = geo_start + int(part_def["dma_packet"])
+        next_part_addr = geo_start + int(part_defs[part_index + 1]["dma_packet"]) if part_index + 1 < len(part_defs) else len(data)
+        dma_tag = read_u32_at(part_addr)
+        if (dma_tag & 0x60000000) != 0x60000000:
+            raise Exception(f"Invalid PS2 DMA tag 0x{dma_tag:08X} at 0x{part_addr:X}")
+        part_end = min(next_part_addr, part_addr + (((dma_tag & 0xFFFF) + 1) * 0x10))
 
-            if marker == 0x6C018000:
-                split_flag_offset = marker_seek
-                ctx.log(
-                    f"✔ 0x6C018000 split flag found at 0x{split_flag_offset:X} -- reading split section header..."
-                )
+        part = StoriesPartGeom()
+        part.material_id = int(part_def["mat_id"])
+        uv_scale_u, uv_scale_v = part_def["uv_scale"]
 
-                _marker_bytes = f.read(4)
-                zeros1_offset = f.tell()
-                zeros1 = f.read(4)
-                ctx.log(
-                    f"  [0x{zeros1_offset:X}] zeros1: {zeros1.hex()} (should be 00 00 00 00)"
-                )
-                zeros2_offset = f.tell()
-                zeros2 = f.read(4)
-                ctx.log(
-                    f"  [0x{zeros2_offset:X}] zeros2: {zeros2.hex()} (should be 00 00 00 00)"
-                )
+        ctx.log(
+            f"\n🔄 Reading geometry dmaOffset {part_index + 1}/{len(part_defs)} (Offset: 0x{part_addr:X})"
+        )
 
-                vert_count1_offset = f.tell()
-                vert_count1 = read_u8(f)
-                ctx.log(f"  [0x{vert_count1_offset:X}] vert_count1: {vert_count1}")
-                pad3_offset = f.tell()
-                pad3 = f.read(3)
-                ctx.log(
-                    f"  [0x{pad3_offset:X}] pad3: {pad3.hex()} (should be 00 00 00)"
-                )
+        w = part_addr + 0x10
+        first_batch = True
+        strip_indices: List[int] = []
 
-                vert_count2_offset = f.tell()
-                vert_count2 = read_u8(f)
-                ctx.log(f"  [0x{vert_count2_offset:X}] vert_count2: {vert_count2}")
-
-                flags_offset = f.tell()
-                flags = read_u16(f)
-                vert_count_dma = flags & 0x7FFF
-                culling_disabled = bool(flags & 0x8000)
-                ctx.log(f"  [0x{flags_offset:X}] flags: 0x{flags:04X}")
-                ctx.log(f"     - vert_count_dma (flags & 0x7FFF): {vert_count_dma}")
-                ctx.log(f"     - culling_disabled (flags & 0x8000): {culling_disabled}")
-
-                pad4_offset = f.tell()
-                pad4 = f.read(4)
-                ctx.log(f"  [0x{pad4_offset:X}] pad4: {pad4.hex()}")
-
-                tech1_offset = f.tell()
-                tech1 = f.read(4)
-                ctx.log(
-                    f"  [0x{tech1_offset:X}] tech1: {tech1.hex()} (typically 40404020)"
-                )
-
-                tech2_offset = f.tell()
-                tech2 = f.read(4)
-                ctx.log(f"  [0x{tech2_offset:X}] tech2: {tech2.hex()}")
-
-                f.seek(marker_seek)
-
-                if vert_count1 != vert_count2:
-                    ctx.log(
-                        f"  WARNING: vert_count1 ({vert_count1}) != vert_count2 ({vert_count2}) at 0x{f.tell():X}"
-                    )
-                else:
-                    ctx.log(f"✔ Vertex counts match: {vert_count1}")
-                ctx.log("=== END OF 0x6C018000 SPLIT BLOCK ===")
-
-            f.seek(16, 1)
-
-            while (marker & 0x60000000) != 0x60000000 and f.tell() < next_part_addr:
-                ctx.log(
-                    f"      Not a tri-strip flag (got 0x{marker:08X}). Skipping 44 bytes (11 DWORDs) at 0x{f.tell():X}"
-                )
-                for _ in range(11):
-                    f.read(4)
-                skip_offset = f.tell()
-                marker = read_u32(f)
-                ctx.log(
-                    f"      Checked tri-strip marker 0x{marker:08X} at 0x{skip_offset:X}"
-                )
-
-            if (marker & 0x60000000) != 0x60000000:
-                ctx.log(f"✗ No valid strip marker found, breaking out at offset 0x{f.tell():X}")
+        while w + 4 <= part_end:
+            while w + 4 <= part_end and read_u32_at(w) == 0:
+                w += 4
+            if w + 4 > part_end or read_u32_at(w) != VIF_UNPACK:
                 break
 
-            if marker == 0x60000000:
-                ctx.log(
-                    f"✔ 0x60000000 tri-strip flag found at 0x{marker_seek:X}, skipping 16 bytes to 0x{marker_seek + 16:X}"
-                )
-                f.seek(marker_seek, 0)
-            elif marker == 0x6C018000:
-                ctx.log(
-                    f"✔ 0x6C018000 split section marker found at 0x{marker_seek:X}, rewinding to flag for detailed breakdown"
-                )
-                f.seek(marker_seek, 0)
-            else:
-                ctx.log(
-                    f"✔ Valid tri-strip flag (0x{marker:08X}) found at 0x{marker_seek:X}, rewinding to flag"
-                )
-                f.seek(-4, 1)
+            raw_batch_vert_count = read_u32_at(w + 0x10) & 0x7FFF
+            skip = 0 if first_batch else 2
+            if raw_batch_vert_count <= skip:
+                break
+            batch_vert_count = raw_batch_vert_count - skip
+            w += 0x14
 
-            for _ in range(4):
-                f.read(4)
+            if read_u32_at(w) != VIF_STMASK:
+                raise Exception(f"Missing PS2 STMASK before positions at 0x{w:X}")
+            w += 0x08
+            if read_u32_at(w) != VIF_STROW:
+                raise Exception(f"Missing PS2 STROW before positions at 0x{w:X}")
+            w += 0x14
+            pos_header_off = w
+            pos_header = read_u32_at(pos_header_off)
+            if (pos_header & 0xFF004000) != VIF_POS_HEADER:
+                raise Exception(f"Unexpected PS2 position header 0x{pos_header:08X} at 0x{pos_header_off:X}")
+            pos_data_off = pos_header_off + 0x04
+            w = skip_unpack(pos_header_off)
 
-            tri_strip_start = f.tell()
-            ctx.log(f"  Tri-Strip Start: 0x{tri_strip_start:X}")
+            uv_data_off = None
+            if res_flags & 0x4:
+                if read_u32_at(w) != VIF_STMASK:
+                    raise Exception(f"Missing PS2 STMASK before UVs at 0x{w:X}")
+                w += 0x08
+                if read_u32_at(w) != VIF_STROW:
+                    raise Exception(f"Missing PS2 STROW before UVs at 0x{w:X}")
+                w += 0x14
+                uv_header_off = w
+                uv_header = read_u32_at(uv_header_off)
+                if (uv_header & 0xFF004000) != VIF_TEX_HEADER:
+                    raise Exception(f"Unexpected PS2 UV header 0x{uv_header:08X} at 0x{uv_header_off:X}")
+                uv_data_off = uv_header_off + 0x04
+                w = skip_unpack(uv_header_off)
 
-            for _ in range(8):
-                f.read(4)
-            _ = read_u16(f)
-            cur_strip_vert_count = read_u8(f)
-            pad_byte = read_u8(f)
-            ctx.log(
-                f"    - curStripVertCount: {cur_strip_vert_count} (padByte={pad_byte}) at 0x{f.tell():X}"
-            )
+            col_data_off = None
+            if res_flags & 0x8:
+                col_header_off = w
+                col_header = read_u32_at(col_header_off)
+                if (col_header & 0xFF004000) != 0x6F000000:
+                    raise Exception(f"Unexpected PS2 color header 0x{col_header:08X} at 0x{col_header_off:X}")
+                col_data_off = col_header_off + 0x04
+                w = skip_unpack(col_header_off)
 
-            vertex_data_offset = f.tell()
-            ctx.log(
-                f"    🧊 Vertex data begins at file offset: 0x{vertex_data_offset:X} ({vertex_data_offset})"
-            )
+            nrm_data_off = None
+            if res_flags & 0x2:
+                nrm_header_off = w
+                nrm_header = read_u32_at(nrm_header_off)
+                if (nrm_header & 0xFF004000) != 0x6A000000:
+                    raise Exception(f"Unexpected PS2 normal header 0x{nrm_header:08X} at 0x{nrm_header_off:X}")
+                nrm_data_off = nrm_header_off + 0x04
+                w = skip_unpack(nrm_header_off)
 
-            verts: List[Tuple[float, float, float]] = []
-            skin_indices: List[List[int]] = []
-            skin_weights: List[List[float]] = []
+            skin_data_off = None
+            if res_flags & 0x10:
+                skin_header_off = w
+                skin_header = read_u32_at(skin_header_off)
+                if (skin_header & 0xFF004000) != 0x6C000000:
+                    raise Exception(f"Unexpected PS2 skin header 0x{skin_header:08X} at 0x{skin_header_off:X}")
+                skin_data_off = skin_header_off + 0x04
+                w = skip_unpack(skin_header_off)
 
-            base_idx = len(part.verts)
-
-            for vi in range(cur_strip_vert_count):
-                offset_x = f.tell()
-                x_raw = read_i16(f)
-                offset_y = f.tell()
-                y_raw = read_i16(f)
-                offset_z = f.tell()
-                z_raw = read_i16(f)
-
-                x = x_raw * g.x_scale * global_scale + tx
-                y = y_raw * g.y_scale * global_scale + ty
-                z = z_raw * g.z_scale * global_scale + tz
-
-                verts.append((x, y, z))
-
-                ctx.log(f"        🧊 Vertex {vi}:")
-                ctx.log(
-                    f"           • X Offset: 0x{offset_x:X}, Raw: {x_raw}, Final: {x:.6f}"
-                )
-                ctx.log(
-                    f"           • Y Offset: 0x{offset_y:X}, Raw: {y_raw}, Final: {y:.6f}"
-                )
-                ctx.log(
-                    f"           • Z Offset: 0x{offset_z:X}, Raw: {z_raw}, Final: {z:.6f}"
-                )
-
-            part.verts.extend(verts)
-
-            for i in range(2, cur_strip_vert_count):
-                if (i % 2) == 0:
-                    v0 = base_idx + i - 2
-                    v1 = base_idx + i - 1
-                    v2 = base_idx + i
+            if read_u32_at(w) != VIF_MSCAL:
+                if w + 4 <= part_end and read_u32_at(w + 0x04) == VIF_MSCAL:
+                    w += 0x04
                 else:
-                    v0 = base_idx + i - 1
-                    v1 = base_idx + i - 2
-                    v2 = base_idx + i
-                if v0 != v1 and v1 != v2 and v2 != v0:
-                    part.faces.append((v0, v1, v2))
+                    raise Exception(f"Missing PS2 MSCAL terminator at 0x{w:X}")
+            w += 0x04
+            while w + 4 <= part_end and read_u32_at(w) == 0:
+                w += 4
 
-            if (cur_strip_vert_count % 2) == 1:
-                pad_short_pos = f.tell()
-                pad_short = read_i16(f)
-                ctx.log(
-                    f"    ⬛ Padding short after verts (odd count): {pad_short} at 0x{pad_short_pos:X}"
+            base_vertex_index = len(part.verts)
+            batch_indices: List[int] = []
+            strip_skin_indices: List[List[int]] = []
+            strip_skin_weights: List[List[float]] = []
+
+            for vertex_index in range(skip, raw_batch_vert_count):
+                pos_off = pos_data_off + (vertex_index * 0x06)
+                x = read_i16_at(pos_off + 0x00) * g.x_scale * global_scale + tx
+                y = read_i16_at(pos_off + 0x02) * g.y_scale * global_scale + ty
+                z = read_i16_at(pos_off + 0x04) * g.z_scale * global_scale + tz
+                part.verts.append((x, y, z))
+
+                if uv_data_off is not None:
+                    uv_off = uv_data_off + (vertex_index * 0x02)
+                    u_raw = data[uv_off]
+                    v_raw = data[uv_off + 1]
+                    part.uvs.append((u_raw / 127.5 * uv_scale_u, v_raw / 127.5 * uv_scale_v))
+                else:
+                    part.uvs.append((0.0, 0.0))
+
+                if col_data_off is not None:
+                    color_off = col_data_off + (vertex_index * 0x02)
+                    color = read_u16_at(color_off)
+                    part.vertex_colors.append(
+                        (
+                            (color & 0x1F) * 255 // 0x1F,
+                            ((color >> 5) & 0x1F) * 255 // 0x1F,
+                            ((color >> 10) & 0x1F) * 255 // 0x1F,
+                            0xFF if (color & 0x8000) else 0,
+                        )
+                    )
+
+                if nrm_data_off is not None:
+                    normal_off = nrm_data_off + (vertex_index * 0x03)
+                    nx, ny, nz = struct.unpack_from("<bbb", data, normal_off)
+                    if not hasattr(part, "normals"):
+                        part.normals = []
+                    part.normals.append((nx / 128.0, ny / 128.0, nz / 128.0))
+
+                if skin_data_off is not None:
+                    skin_off = skin_data_off + (vertex_index * 0x10)
+                    indices: List[int] = []
+                    weights: List[float] = []
+                    for weight_index in range(4):
+                        packed = read_u32_at(skin_off + (weight_index * 0x04))
+                        weight = packed & ~0xFF
+                        bone_index = (packed >> 2) & 0x3F
+                        indices.append(0 if weight == 0 else bone_index)
+                        weights.append(weight / float(1 << 24) if weight else 0.0)
+                    strip_skin_indices.append(indices)
+                    strip_skin_weights.append(weights)
+
+                batch_indices.append(base_vertex_index + len(batch_indices))
+
+            if not first_batch and batch_indices and strip_indices:
+                first_index = batch_indices[0]
+                strip_indices.append(strip_indices[-1])
+                strip_indices.append(first_index)
+                if len(strip_indices) % 2:
+                    strip_indices.append(first_index)
+            strip_indices.extend(batch_indices)
+
+            part.strips_meta.append(
+                StripMeta(
+                    base_vertex_index=base_vertex_index,
+                    vertex_count=batch_vert_count,
+                    skin_indices=[list(lst) for lst in strip_skin_indices],
+                    skin_weights=[list(lst) for lst in strip_skin_weights],
                 )
-
-            align4 = f.tell() % 4
-            if align4:
-                pad_bytes = 4 - align4
-                f.read(pad_bytes)
-                ctx.log(f"    🟦 Align to dword after verts: {pad_bytes} bytes")
-
-            
-            uv_header_pos = f.tell()
-            uv_header = None
-            found = scan_for_vif_header(
-                start=uv_header_pos,
-                end=next_part_addr,
-                wanted_cmd=0x76,
-                max_scan_bytes=0x200,
-                step=4,
-                require_b1_80=True,
             )
-            if found:
-                uv_header_pos, uv_header = found
-                ctx.log(f"    ✔ Found UV header by scan at 0x{uv_header_pos:X}")
+            first_batch = False
+
+        for face_index in range(2, len(strip_indices)):
+            if (face_index % 2) == 0:
+                v0 = strip_indices[face_index - 2]
+                v1 = strip_indices[face_index - 1]
+                v2 = strip_indices[face_index]
             else:
-                f.seek(uv_header_pos, 0)
-                uv_header = f.read(4)
-                if len(uv_header) < 4:
-                    break
-                ctx.log(
-                    f"    ⚠ UV header scan failed; using current position 0x{uv_header_pos:X}"
-                )
-
-            f.seek(uv_header_pos + 4, 0)
-            b0, b1, b2, b3 = uv_header[0], uv_header[1], uv_header[2], uv_header[3]
-            cur_strip_tvert_count = int(b2)
-            if cur_strip_tvert_count <= 0 or cur_strip_tvert_count > 0x80:
-                ctx.log(
-                    f"    ⚠ UV count b2={cur_strip_tvert_count} looks invalid; using curStripVertCount={cur_strip_vert_count}"
-                )
-                cur_strip_tvert_count = int(cur_strip_vert_count)
-            ctx.log(
-                f"    ⬛ UV header at 0x{uv_header_pos:X}: b0=0x{b0:02X}, b1=0x{b1:02X}, b2 (count)={cur_strip_tvert_count}, b3=0x{b3:02X}"
-            )
-            if b3 != 0x76:
-                ctx.log(f"    ⚠ Unexpected UV section header b3=0x{b3:02X} at 0x{uv_header_pos:X}")
-
-            uvs: List[Tuple[float, float]] = []
-            uv_bytes = f.read(cur_strip_tvert_count * 2)
-            for i in range(cur_strip_tvert_count):
-                if (i * 2 + 1) < len(uv_bytes):
-                    u_raw = uv_bytes[i * 2]
-                    v_raw = uv_bytes[i * 2 + 1]
-                    u_f = u_raw / 127.5
-                    v_f = v_raw / 127.5
-                    uvs.append((u_f, v_f))
-                    ctx.log(
-                        f"      🟪 UV {i}: U={u_f:.6f}, V={v_f:.6f} (raw: {u_raw}, {v_raw})"
-                    )
-            pad = (4 - ((cur_strip_tvert_count * 2) % 4)) % 4
-            if pad:
-                f.read(pad)
-                ctx.log(f"    🟦 Padding after UVs: {pad} bytes")
-            part.uvs.extend(uvs)
-
-            while True:
-                subsection_pos = f.tell()
-                header = f.read(4)
-                if len(header) < 4:
-                    break
-
-                marker_val = struct.unpack("<I", header)[0]
-                b0, b1, b2, b3 = header[0], header[1], header[2], header[3]
-
-                if marker_val == 0x60000000:
-                    ctx.log(
-                        f"✔ Found 0x60000000 strip marker at 0x{subsection_pos:X} -- skipping 16 bytes"
-                    )
-                    f.seek(16, 1)
-                    break
-                elif marker_val == 0x6C018000:
-                    ctx.log(
-                        f"✔ Found 0x6C018000 split flag at 0x{subsection_pos:X} -- rewinding to marker"
-                    )
-                    f.seek(subsection_pos, 0)
-                    break
-
-                if b1 == 0x80 and b3 in (0x6F, 0x6A, 0x6C):
-                    section_count = b2
-                    ctx.log(
-                        f"   >> Subsection header: b1={b1:02X}, count={section_count}, b3={b3:02X} at 0x{subsection_pos:X}"
-                    )
-
-                    if b3 == 0x6F:
-                        ctx.log(f"      🎨 Reading {section_count} vertex colors")
-                        for i in range(section_count):
-                            vcolor = read_u16(f)
-                            r = (vcolor & 0x1F) * (1.0 / 32.0)
-                            gcol = ((vcolor >> 5) & 0x1F) * (1.0 / 32.0)
-                            b = ((vcolor >> 10) & 0x1F) * (1.0 / 32.0)
-                            a = ((vcolor >> 15) & 0x01) * 1.0
-                            ctx.log(
-                                f"         R={r:.3f} G={gcol:.3f} B={b:.3f} A={a:.1f} (raw=0x{vcolor:04X})"
-                            )
-                        pad = 2 - ((2 * section_count) % 4)
-                        if pad != 4:
-                            f.read(pad)
-
-                    elif b3 == 0x6A:
-                        ctx.log(f"      🧲 Reading {section_count} normals")
-                        norms: List[Tuple[float, float, float]] = []
-                        for i in range(section_count):
-                            nx = read_i8(f) / 128.0
-                            ny = read_i8(f) / 128.0
-                            nz = read_i8(f) / 128.0
-                            norms.append((nx, ny, nz))
-                            ctx.log(f"         N={nx:.4f} {ny:.4f} {nz:.4f}")
-                        pad = 4 - ((3 * section_count) % 4)
-                        if pad != 4:
-                            f.read(pad)
-
-                        if section_count:
-                            if not hasattr(part, 'normals'):
-                                part.normals = []  
-                            part.normals.extend(norms)
-
-                    elif b3 == 0x6C:
-                        ctx.log(f"      🦴 Reading {section_count} skin weights")
-                        for i in range(section_count):
-                            bone1 = read_u16(f) // 4
-                            _ = read_u8(f)
-                            w1 = read_u8(f) / 128.0
-                            bone2 = read_u16(f) // 4
-                            _ = read_u8(f)
-                            w2 = read_u8(f) / 128.0
-                            bone3 = read_u16(f) // 4
-                            _ = read_u8(f)
-                            w3 = read_u8(f) / 128.0
-                            bone4 = read_u16(f) // 4
-                            _ = read_u8(f)
-                            w4 = read_u8(f) / 128.0
-
-                            ctx.log(
-                                f"         B1={bone1} W1={w1:.4f} ... B4={bone4} W4={w4:.4f}"
-                            )
-
-                            indices = [bone1, bone2, bone3, bone4]
-                            weights = [w1, w2, w3, w4]
-
-                            skin_indices.append(indices)
-                            skin_weights.append(weights)
-                    continue
-
-            if len(skin_indices) != cur_strip_vert_count or len(skin_weights) != cur_strip_vert_count:
-                ctx.log(
-                    f"[WARN] strip verts={cur_strip_vert_count}, skin_idx={len(skin_indices)}, skin_wts={len(skin_weights)} — padding zeros to match"
-                )
-                while len(skin_indices) < cur_strip_vert_count:
-                    skin_indices.append([0, 0, 0, 0])
-                    skin_weights.append([0.0, 0.0, 0.0, 0.0])
-                skin_indices = skin_indices[:cur_strip_vert_count]
-                skin_weights = skin_weights[:cur_strip_vert_count]
-
-            strip_meta = StripMeta(
-                base_vertex_index=base_idx,
-                vertex_count=cur_strip_vert_count,
-                skin_indices=[list(lst) for lst in skin_indices],
-                skin_weights=[list(lst) for lst in skin_weights],
-            )
-            part.strips_meta.append(strip_meta)
-            skin_indices.clear()
-            skin_weights.clear()
+                v0 = strip_indices[face_index - 1]
+                v1 = strip_indices[face_index - 2]
+                v2 = strip_indices[face_index]
+            if v0 != v1 and v1 != v2 and v2 != v0:
+                part.faces.append((v0, v1, v2))
 
         g.parts.append(part)
 

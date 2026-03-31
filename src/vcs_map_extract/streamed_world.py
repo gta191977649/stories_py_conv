@@ -62,6 +62,10 @@ def _ptr_to_body_offset(raw_ptr: int) -> int:
     return raw_ptr - LEVEL_BODY_OFFSET
 
 
+def _matrix_signature(values: tuple[float, ...]) -> tuple[float, ...]:
+    return tuple(round(float(value), 6) for value in values)
+
+
 @dataclass(slots=True)
 class SectorHeader:
     index: int
@@ -434,7 +438,9 @@ def plan_streamed_archive(
     unique_ipl_ids: set[int] = set()
     unresolved_ids: set[int] = set()
     unresolved_names: list[str] = []
-    contributions_by_model: dict[str, dict[int, StreamedPlacement]] = defaultdict(dict)
+    contributions_by_model: dict[str, dict[tuple[int, tuple[float, ...]], dict[int, StreamedPlacement]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
     model_meta: dict[str, tuple[str, str]] = {}
     txd_exports: dict[str, set[int]] = defaultdict(set)
     model_hidden_alternates: dict[str, bool] = defaultdict(bool)
@@ -477,20 +483,27 @@ def plan_streamed_archive(
         )
         if not visit.visible:
             model_hidden_alternates[model_name] = True
-        best = contributions_by_model[model_name].get(instance.res_id)
+        cluster_key = (instance.ipl_id, _matrix_signature(instance.matrix))
+        cluster = contributions_by_model[model_name][cluster_key]
+        best = cluster.get(instance.res_id)
         if best is None:
-            contributions_by_model[model_name][instance.res_id] = placement
+            cluster[instance.res_id] = placement
         else:
             best.placement_count += 1
             if _prefer_placement(placement, best):
                 placement.placement_count = best.placement_count
-                contributions_by_model[model_name][instance.res_id] = placement
+                cluster[instance.res_id] = placement
 
     model_exports: list[StreamedModelPlan] = []
     for model_name in sorted(contributions_by_model):
         txd_name, source_file = model_meta[model_name]
+        clusters = contributions_by_model[model_name]
+        cluster_items = sorted(
+            clusters.items(),
+            key=lambda item: _cluster_sort_key(item[1].values()),
+        )
         placements = sorted(
-            contributions_by_model[model_name].values(),
+            cluster_items[0][1].values(),
             key=lambda item: (
                 not item.visible,
                 SOURCE_PRIORITY[item.source_kind],
@@ -526,6 +539,7 @@ def plan_streamed_archive(
         "linked_rows": linked_rows,
         "no_link_rows": no_link_rows,
         "planned_models": len(model_exports),
+        "model_clusters": sum(len(clusters) for clusters in contributions_by_model.values()),
         "planned_txds": len(txd_exports),
         "planned_res_ids": sum(len(model.placements) for model in model_exports),
         "unresolved_ids": len(unresolved_ids),
@@ -546,3 +560,14 @@ def _prefer_placement(candidate: StreamedPlacement, current: StreamedPlacement) 
         (not candidate.visible, SOURCE_PRIORITY[candidate.source_kind], candidate.pass_index, candidate.sector_id, candidate.res_id)
         < (not current.visible, SOURCE_PRIORITY[current.source_kind], current.pass_index, current.sector_id, current.res_id)
     )
+
+
+def _cluster_sort_key(placements: object) -> tuple[int, int, int, int, int, int]:
+    items = list(placements)
+    unique_res_ids = len(items)
+    visible_count = sum(1 for item in items if item.visible)
+    world_count = sum(1 for item in items if item.source_kind == "world")
+    total_uses = sum(item.placement_count for item in items)
+    best_priority = min(SOURCE_PRIORITY[item.source_kind] for item in items)
+    best_pass = min(item.pass_index for item in items)
+    return (-unique_res_ids, -visible_count, -world_count, -total_uses, best_priority, best_pass)

@@ -507,14 +507,55 @@ class LVZArchive:
         return geometry
 
 
+def rw_matrix(values: tuple[float, ...]) -> np.ndarray:
+    raw = np.asarray(values, dtype=np.float64).reshape(4, 4)
+    return raw.T
+
+
+def basis_lengths(values: tuple[float, ...]) -> tuple[float, float, float]:
+    matrix = rw_matrix(values)
+    linear = matrix[:3, :3]
+    lengths = np.linalg.norm(linear, axis=0)
+    return (float(lengths[0]), float(lengths[1]), float(lengths[2]))
+
+
 def matrix_inverse(values: tuple[float, ...]) -> np.ndarray:
-    return np.linalg.inv(np.asarray(values, dtype=np.float64).reshape(4, 4))
+    return np.linalg.inv(rw_matrix(values))
 
 
 def transform_point(matrix: np.ndarray, point: tuple[float, float, float]) -> tuple[float, float, float]:
     vector = np.array([point[0], point[1], point[2], 1.0], dtype=np.float64)
     out = matrix @ vector
     return (float(out[0]), float(out[1]), float(out[2]))
+
+
+def translation_inverse(values: tuple[float, ...]) -> np.ndarray:
+    matrix = np.identity(4, dtype=np.float64)
+    world = rw_matrix(values)
+    matrix[0, 3] = -world[0, 3]
+    matrix[1, 3] = -world[1, 3]
+    matrix[2, 3] = -world[2, 3]
+    return matrix
+
+
+def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarray, StreamedPlacement | None]:
+    best_transform: np.ndarray | None = None
+    best_placement: StreamedPlacement | None = None
+    best_score = float("-inf")
+    for placement in placements:
+        lengths = basis_lengths(placement.matrix)
+        if not all(math.isfinite(length) for length in lengths):
+            continue
+        score = max(lengths)
+        if score <= 1e-6:
+            continue
+        if score > best_score:
+            best_score = score
+            best_transform = translation_inverse(placement.matrix)
+            best_placement = placement
+    if best_transform is not None:
+        return best_transform, best_placement
+    return np.identity(4, dtype=np.float64), None
 
 
 def merge_texture(existing: DecodedTexture, incoming: DecodedTexture) -> DecodedTexture:
@@ -575,8 +616,16 @@ def export_streamed_archive(
         recovered_only_from_hidden = False
         bad_fragments_for_model = 0
 
-        base_matrix = (visible_placements or hidden_placements)[0].matrix
-        base_inverse = matrix_inverse(base_matrix)
+        base_inverse, base_placement = choose_base_transform(visible_placements or hidden_placements)
+        if base_placement is None:
+            report.streamed_diagnostics.append(
+                f"{archive_name}: all placement matrices for {model.model_name} were degenerate; used identity fallback"
+            )
+        elif base_placement is not (visible_placements or hidden_placements)[0]:
+            report.streamed_diagnostics.append(
+                f"{archive_name}: skipped degenerate base placement for {model.model_name}; "
+                f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
+            )
 
         for set_index, placements in enumerate(placement_sets):
             fallback_mode = set_index > 0
@@ -599,7 +648,7 @@ def export_streamed_archive(
                 if fragment_key in seen_fragments:
                     continue
                 seen_fragments.add(fragment_key)
-                local_matrix = base_inverse @ np.asarray(placement.matrix, dtype=np.float64).reshape(4, 4)
+                local_matrix = base_inverse @ rw_matrix(placement.matrix)
                 transformed_vertices = [transform_point(local_matrix, vertex) for vertex in geometry.vertices]
                 if not _fragment_vertices_valid(transformed_vertices):
                     skipped_bad_fragments += 1
