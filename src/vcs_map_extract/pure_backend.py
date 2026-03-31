@@ -1,17 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable
 
 import numpy as np
 
-from .external_libs import load_bleeds_modules, load_dragonff_modules
+from .mathutils_compat import install_mathutils_shim
 from .utils import sanitize_filename
 
 
 RW_VERSION = 0x36003
+
+
+@lru_cache(maxsize=1)
+def load_bleeds_modules():
+    install_mathutils_shim()
+    from .vendor.bleeds import col2, mdl, tex
+
+    def quiet_log(self, msg: str) -> None:
+        self.debug_log.append(str(msg))
+
+    mdl.StoriesMDLContext.log = quiet_log
+    return mdl, tex, col2
+
+
+@lru_cache(maxsize=1)
+def load_dragonff_modules():
+    from .vendor.dragonff import col, dff, txd
+
+    return dff, txd, col
 
 
 @dataclass(slots=True)

@@ -268,5 +268,10 @@ IDE model name
   - swap/default-visible conflict notes
   - missing-model breakdown by IDE file
 - Standard `MDL` / `TEX` / `COL2` conversion now runs in pure Python using BLeeds parsing logic plus DragonFF RW writers.
+- The required reference data is bundled in this repo:
+  - `vcs_links.inc`
+  - `vcsnames.inc`
+  - `bruteforcedvcsnames.inc`
+- The required pure-Python helper code is also vendored in this repo, so the tool no longer depends on sibling checkouts of `g3DTZ`, `librwgta`, `BLeeds`, or `DragonFF`.
 - `BEACH`, `MAINLA`, and `MALL` now use a pure-Python streamed exporter with world, interior, and area-resource loading.
 - Coverage is still best-effort: some streamed resources are malformed, unresolved, or too extreme for DragonFF mesh/collision writers, and those cases are recorded in `report.txt` instead of aborting the run.
