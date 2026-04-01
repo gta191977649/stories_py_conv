@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .constants import ARCHIVE_ORDER, EXPECTED_FILES, STANDARD_ARCHIVES, STREAMED_ARCHIVES
-from .game_dat import decode_game_dat
+from .game_dat import GameDat, decode_game_dat
 from .ide_catalog import parse_ide_directory
 from .img_io import ImgDirectoryEntry, ImgReader
-from .ipl_parser import parse_ipl_directory
+from .ipl_parser import merge_ipl_summaries, parse_ipl_directory
 from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import write_packed_img
@@ -58,6 +58,7 @@ def _queue_standard_jobs(
     root: Path,
     output_root: Path,
     ide_catalog: dict,
+    resolver: NameResolver,
     summary: dict[str, dict[str, int]],
 ) -> list[dict[str, str]]:
     jobs: list[dict[str, str]] = []
@@ -70,17 +71,24 @@ def _queue_standard_jobs(
         queued_models: set[str] = set()
         queued_txds: set[str] = set()
         queued_cols: set[str] = set()
+        queued_output_models: set[str] = set()
+        queued_output_cols: set[str] = set()
 
         for ide_model in ide_catalog.values():
             mdl_key = f"{ide_model.model_name}.mdl".lower()
             if mdl_key in entries and mdl_key not in queued_models:
-                queued_models.add(mdl_key)
-                entry = entries[mdl_key]
-                raw_path = temp_root / archive_name / entry.name
-                safe_mkdir(raw_path.parent)
-                raw_path.write_bytes(reader.read_entry(entry))
-                output_path = archive_dir / f"{sanitize_filename(ide_model.model_name)}.dff"
-                jobs.append({"type": "mdl", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
+                output_stem = sanitize_filename(resolver.canonical_model_name(ide_model.model_id, ide_model.model_name))
+                if output_stem in queued_output_models:
+                    queued_models.add(mdl_key)
+                else:
+                    queued_output_models.add(output_stem)
+                    queued_models.add(mdl_key)
+                    entry = entries[mdl_key]
+                    raw_path = temp_root / archive_name / entry.name
+                    safe_mkdir(raw_path.parent)
+                    raw_path.write_bytes(reader.read_entry(entry))
+                    output_path = archive_dir / f"{output_stem}.dff"
+                    jobs.append({"type": "mdl", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
 
             txd_base = ide_model.txd_name.lower()
             if txd_base and txd_base != "null":
@@ -99,12 +107,16 @@ def _queue_standard_jobs(
 
             col_key = f"{ide_model.model_name}.col2".lower()
             if col_key in entries and col_key not in queued_cols:
+                output_stem = sanitize_filename(resolver.canonical_model_name(ide_model.model_id, ide_model.model_name))
                 queued_cols.add(col_key)
+                if output_stem in queued_output_cols:
+                    continue
+                queued_output_cols.add(output_stem)
                 entry = entries[col_key]
                 raw_path = temp_root / archive_name / entry.name
                 safe_mkdir(raw_path.parent)
                 raw_path.write_bytes(reader.read_entry(entry))
-                output_path = archive_dir / f"{sanitize_filename(ide_model.model_name)}.col"
+                output_path = archive_dir / f"{output_stem}.col"
                 jobs.append({"type": "col2", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
 
         summary[archive_name]["queued_models"] = len(queued_models)
@@ -158,12 +170,29 @@ def _cleanup_stale_generated_outputs(output_root: Path) -> None:
             stale_interior_generic.unlink()
 
 
-def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = False) -> int:
+def _clean_output_dir(output_root: Path) -> None:
+    if not output_root.exists():
+        safe_mkdir(output_root)
+        return
+    for child in output_root.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: bool, decode_dat: bool = False) -> int:
     root = normalize_input_root(input_path)
     output_root = Path(output_path).expanduser().resolve()
     _log(f"[run] input={root}")
     _log(f"[run] output={output_root}")
     safe_mkdir(output_root)
+    if clean:
+        _log(f"[clean] removing contents of {output_root}")
+        _clean_output_dir(output_root)
+        safe_mkdir(output_root)
+        if not export and not decode_dat:
+            return 0
     if decode_dat:
         game_dat_path = _validate_game_dat(root)
         _log(f"[decode-dat] decoding {game_dat_path}")
@@ -176,14 +205,19 @@ def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = Fal
         _log(
             "[decode-dat] instances: "
             f"buildings={stats.building_instances}, treadables={stats.treadable_instances}, "
-            f"dummys={stats.dummy_instances}, cull_zones={stats.cull_zones}"
+            f"dummys={stats.dummy_instances}, streamed_generated={stats.generated_streamed_instances}, "
+            f"cull_zones={stats.cull_zones}"
         )
         if stats.unsupported_weapons or stats.unsupported_vehicles or stats.unsupported_peds:
             _log(
                 "[decode-dat] skipped unsupported non-map sections: "
                 f"weapons={stats.unsupported_weapons}, vehicles={stats.unsupported_vehicles}, peds={stats.unsupported_peds}"
             )
-        return 0
+        if not export:
+            return 0
+
+    if not export:
+        raise ValueError("Export mode was not selected. Use --export for model extraction.")
 
     _validate_root(root)
     from .pure_backend import run_conversion_jobs, write_txd_from_decoded_textures
@@ -199,10 +233,21 @@ def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = Fal
             stale_knackers.unlink()
 
     ide_catalog = parse_ide_directory(root / "ide")
-    resolver = NameResolver(ide_catalog)
+    game_dat = None
+    game_dat_models = None
+    game_dat_path = root / "GAME.dat"
+    if game_dat_path.is_file():
+        try:
+            game_dat = GameDat.from_path(game_dat_path)
+            game_dat_models = game_dat.model_info_by_id
+        except Exception as exc:
+            _log(f"[names] failed to read {game_dat_path}: {exc}")
+    resolver = NameResolver(ide_catalog, game_dat_models=game_dat_models)
     report = ReportData()
     summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ipl_summary = parse_ipl_directory(root / "ipl")
+    if game_dat is not None:
+        ipl_summary = merge_ipl_summaries(ipl_summary, game_dat.build_ipl_summary())
     for source_file in sorted(ipl_summary.inst_count_by_file):
         report.ipl_diagnostics.append(
             f"{source_file}: inst_rows={ipl_summary.inst_count_by_file[source_file]}, "
@@ -218,7 +263,7 @@ def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = Fal
         )
 
     with tempfile.TemporaryDirectory(prefix="vcs_map_extract_raw_") as tmpdir:
-        standard_jobs = _queue_standard_jobs(Path(tmpdir), root, output_root, ide_catalog, summary)
+        standard_jobs = _queue_standard_jobs(Path(tmpdir), root, output_root, ide_catalog, resolver, summary)
         _log(f"[standard] running {len(standard_jobs)} conversion jobs")
         standard_results = run_conversion_jobs(standard_jobs) if standard_jobs else []
         _summarize_standard_results(standard_results, summary, report)
@@ -277,10 +322,10 @@ def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = Fal
         for archive in ARCHIVE_ORDER
     }
     report.missing_models = sorted(
-        model.model_name
+        resolver.canonical_model_name(model.model_id, model.model_name)
         for model in ide_catalog.values()
         if not any(
-            sanitize_filename(model.model_name) == stem
+            sanitize_filename(resolver.canonical_model_name(model.model_id, model.model_name)) == stem
             for archive in ARCHIVE_ORDER
             for stem in exported_stems_by_archive[archive]
         )
@@ -288,15 +333,16 @@ def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = Fal
     missing_by_source_file: dict[str, list[str]] = defaultdict(list)
     missing_lookup = set(report.missing_models)
     for model in ide_catalog.values():
-        if model.model_name in missing_lookup:
-            missing_by_source_file[model.source_file].append(model.model_name)
+        canonical_name = resolver.canonical_model_name(model.model_id, model.model_name)
+        if canonical_name in missing_lookup:
+            missing_by_source_file[model.source_file].append(canonical_name)
     report.missing_models_by_source_file = {
         source_file: sorted(names)
         for source_file, names in sorted(missing_by_source_file.items())
     }
 
-    if packimg:
-        _log("[packimg] writing OUTPUT/vcs_map.img")
+    if buildimg:
+        _log("[buildimg] writing OUTPUT/vcs_map.img")
         _packed_path, conflicts = write_packed_img(output_root)
         report.duplicate_pack_conflicts.extend(conflicts)
 

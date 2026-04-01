@@ -29,6 +29,7 @@ class IplSummary:
     nonzero_interior_by_file: dict[str, int] = field(default_factory=dict)
     nonzero_instances: list[IplInstance] = field(default_factory=list)
     transforms_by_model: dict[str, list[IplTransform]] = field(default_factory=dict)
+    transforms_by_id: dict[int, list[IplTransform]] = field(default_factory=dict)
 
 
 def _parse_float(value: str) -> float | None:
@@ -83,7 +84,7 @@ def parse_ipl_directory(ipl_dir: Path) -> IplSummary:
                 rotation = (float(rx), float(ry), float(rz), float(rw))
                 if all(math.isfinite(value) for value in (*rotation, float(px), float(py), float(pz))):
                     summary.transforms_by_model.setdefault(parts[1].lower(), []).append(
-                        IplTransform(
+                        transform := IplTransform(
                             model_id=instance_id,
                             model_name=parts[1],
                             interior=interior,
@@ -92,6 +93,7 @@ def parse_ipl_directory(ipl_dir: Path) -> IplSummary:
                             source_file=ipl_path.name,
                         )
                     )
+                    summary.transforms_by_id.setdefault(instance_id, []).append(transform)
             if interior != 0:
                 nonzero_count += 1
                 summary.nonzero_instances.append(
@@ -107,3 +109,16 @@ def parse_ipl_directory(ipl_dir: Path) -> IplSummary:
         summary.nonzero_interior_by_file[ipl_path.name] = nonzero_count
 
     return summary
+
+
+def merge_ipl_summaries(*summaries: IplSummary) -> IplSummary:
+    merged = IplSummary()
+    for summary in summaries:
+        merged.inst_count_by_file.update(summary.inst_count_by_file)
+        merged.nonzero_interior_by_file.update(summary.nonzero_interior_by_file)
+        merged.nonzero_instances.extend(summary.nonzero_instances)
+        for model_name, transforms in summary.transforms_by_model.items():
+            merged.transforms_by_model.setdefault(model_name, []).extend(transforms)
+        for model_id, transforms in summary.transforms_by_id.items():
+            merged.transforms_by_id.setdefault(model_id, []).extend(transforms)
+    return merged

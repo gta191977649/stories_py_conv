@@ -508,9 +508,15 @@ def plan_streamed_archive(
         if is_interior_visit:
             interior_instances_seen += 1
             interior_sector_ids.add(visit.sector_id)
-        link = resolver.resolve_streamed_link(instance.world_id)
-        model_name = link[1] if link is not None else None
-        linked_ipl_id = link[0] if link is not None else None
+        model_meta = resolver.resolve_streamed_model_meta(instance.world_id) if hasattr(resolver, "resolve_streamed_model_meta") else None
+        if model_meta is not None:
+            linked_ipl_id, _model_id, model_name, txd_name, source_file = model_meta
+        else:
+            link = resolver.resolve_streamed_link(instance.world_id)
+            model_name = link[1] if link is not None else None
+            linked_ipl_id = link[0] if link is not None else None
+            txd_name = ""
+            source_file = f"{archive_name}.LVZ"
         if model_name is None and not is_interior_visit:
             no_link_rows += 1
             if instance.world_id not in unresolved_ids and len(unresolved_ids) < MAX_REPORTED_UNRESOLVED:
@@ -536,8 +542,10 @@ def plan_streamed_archive(
         if model_name is not None:
             linked_rows += 1
             ide_model = ide_catalog.get(model_name.lower())
-            txd_name = ide_model.txd_name if ide_model is not None else ""
-            source_file = ide_model.source_file if ide_model is not None else f"{archive_name}.LVZ"
+            if ide_model is not None:
+                if not txd_name or txd_name.lower() == "null":
+                    txd_name = ide_model.txd_name
+                source_file = ide_model.source_file
             if not visit.visible:
                 model_hidden_alternates[model_name] = True
             if is_interior_visit:

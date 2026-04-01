@@ -4,8 +4,11 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import struct
+from collections import defaultdict
 
-from .reference_data import load_vcs_name_table
+from .ipl_parser import IplSummary, IplTransform
+from .reference_data import load_streamed_link_table, load_vcs_name_table
+from .streamed_world import LEVEL_IDS, LevelChunk, SOURCE_PRIORITY
 from .utils import safe_mkdir
 
 
@@ -13,16 +16,23 @@ GTAG_HEADER_STRUCT = struct.Struct("<7I2H")
 POOL_HEADER_STRUCT = struct.Struct("<4I")
 COL_ENTRY_STRUCT = struct.Struct("<I?3x4f4f20siiI")
 CULL_ZONE_STRUCT = struct.Struct("<8h")
+C2D_EFFECT_STRUCT = struct.Struct("<4f4B1B3x40s")
 
 RESOURCE_IMAGE_OFFSET = GTAG_HEADER_STRUCT.size
 DEFAULT_IDE_LAST_INDEX = 395
 ENTITY_ENTRY_SIZE = 96
-ENTITY_MODEL_INDEX_OFFSET = 84
+ENTITY_MODEL_INDEX_OFFSET = 86
 
 MITYPE_SIMPLE = 1
+MITYPE_MLO = 2
 MITYPE_TIME = 3
 MITYPE_WEAPON = 4
 MITYPE_CLUMP = 5
+MITYPE_VEHICLE = 6
+MITYPE_PED = 7
+
+COMMENTED_MODELS = {"IslandLODbeach", "IslandLODmainland"}
+STREAM_NEAR_DUPLICATE_TOLERANCE = 6.0
 
 
 @dataclass(slots=True)
@@ -75,6 +85,10 @@ class GameDatModelInfo:
             row = f"{row}, {self.time_on}, {self.time_off}"
         return row
 
+    @property
+    def is_map_model(self) -> bool:
+        return self.model_type in {MITYPE_SIMPLE, MITYPE_MLO, MITYPE_TIME, MITYPE_CLUMP}
+
 
 @dataclass(slots=True)
 class GameDatDecodeStats:
@@ -86,6 +100,7 @@ class GameDatDecodeStats:
     building_instances: int
     treadable_instances: int
     dummy_instances: int
+    generated_streamed_instances: int
     cull_zones: int
     unsupported_weapons: int
     unsupported_vehicles: int
@@ -103,6 +118,8 @@ class GameDat:
         self.dummy_pool = self._read_pool(self._resource_u32(12))
         self.texlist_pool = self._read_pool(self._resource_u32(64))
         self.col_pool = self._read_pool(self._resource_u32(72))
+        self.num_2d_effects = self._resource_u32(52)
+        self.effects_ptr = self._resource_u32(56)
         self.num_attribute_zones = self._resource_i32(120)
         self.attribute_zones_ptr = self._resource_u32(124)
         self._model_infos: list[GameDatModelInfo] | None = None
@@ -248,17 +265,188 @@ class GameDat:
                 lines.append("end")
             (ide_dir / f"{name}.ide").write_text("\n".join(lines) + "\n", encoding="utf-8")
             written += 1
+        effects_rows = self._collect_2dfx_rows()
+        if effects_rows:
+            lines = ["# Decoded from GAME.dat", "2dfx", *effects_rows, "end"]
+            (ide_dir / "2dfx.ide").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            written += 1
         return written, fallback_hash_names
 
-    def decode_ipl_files(self, ipl_dir: Path) -> tuple[int, int, int, int, int]:
-        safe_mkdir(ipl_dir)
-        buildings = self._write_pool_ipl(ipl_dir / "Buildings.ipl", self.building_pool)
-        treadables = self._write_pool_ipl(ipl_dir / "Treadables.ipl", self.treadable_pool)
-        dummys = self._write_pool_ipl(ipl_dir / "Dummys.ipl", self.dummy_pool)
-        cull_zones = self._write_cull_ipl(ipl_dir / "cull.ipl")
-        return 4, buildings, treadables, dummys, cull_zones
+    def _collect_2dfx_rows(self) -> list[str]:
+        rows: list[str] = []
+        for model in self.iter_model_infos():
+            if not model.is_map_model:
+                continue
+            ptr = self._u32(self.model_info_ptrs + (model.model_id * 4))
+            if ptr == 0:
+                continue
+            num_effects = self._u8(ptr + 17)
+            first_effect = self._s16(ptr + 24)
+            if num_effects <= 0 or first_effect < 0:
+                continue
+            for effect_index in range(first_effect, first_effect + num_effects):
+                if effect_index >= self.num_2d_effects:
+                    break
+                effect_ptr = self.effects_ptr + (effect_index * 64)
+                row = self._format_2dfx_row(model.model_id, effect_ptr)
+                if row is not None:
+                    rows.append(row)
+        return rows
 
-    def _write_pool_ipl(self, path: Path, pool: PoolInfo) -> int:
+    def _format_2dfx_row(self, model_id: int, effect_ptr: int) -> str | None:
+        px, py, pz, _pw = struct.unpack_from("<4f", self.data, effect_ptr)
+        r, g, b, a = struct.unpack_from("<4B", self.data, effect_ptr + 16)
+        effect_type = self._u8(effect_ptr + 20)
+        if effect_type == 0:
+            corona_ptr = self._u32(effect_ptr + 48)
+            shadow_ptr = self._u32(effect_ptr + 52)
+            return ", ".join(
+                (
+                    str(model_id),
+                    _format_number(px),
+                    _format_number(py),
+                    _format_number(pz),
+                    str(r),
+                    str(g),
+                    str(b),
+                    str(a),
+                    str(effect_type),
+                    f"\"{self._read_texture_name(corona_ptr)}\"",
+                    f"\"{self._read_texture_name(shadow_ptr)}\"",
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 24)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 28)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 32)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 36)[0]),
+                    str(self._u8(effect_ptr + 43)),
+                    str(self._u8(effect_ptr + 40)),
+                    str(self._u8(effect_ptr + 41)),
+                    str(self._u8(effect_ptr + 42)),
+                    str(self._u8(effect_ptr + 44)),
+                )
+            )
+        if effect_type == 1:
+            return ", ".join(
+                (
+                    str(model_id),
+                    _format_number(px),
+                    _format_number(py),
+                    _format_number(pz),
+                    str(r),
+                    str(g),
+                    str(b),
+                    str(a),
+                    str(effect_type),
+                    str(self._i32(effect_ptr + 24)),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 28)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 32)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 36)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 40)[0]),
+                )
+            )
+        if effect_type == 2:
+            return ", ".join(
+                (
+                    str(model_id),
+                    _format_number(px),
+                    _format_number(py),
+                    _format_number(pz),
+                    str(r),
+                    str(g),
+                    str(b),
+                    str(a),
+                    str(effect_type),
+                    str(self._u8(effect_ptr + 36)),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 24)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 28)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 32)[0]),
+                    str(self._u8(effect_ptr + 37)),
+                )
+            )
+        if effect_type == 3:
+            return ", ".join(
+                (
+                    str(model_id),
+                    _format_number(px),
+                    _format_number(py),
+                    _format_number(pz),
+                    str(r),
+                    str(g),
+                    str(b),
+                    str(a),
+                    str(effect_type),
+                    str(self._u8(effect_ptr + 48)),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 24)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 28)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 32)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 36)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 40)[0]),
+                    _format_number(struct.unpack_from("<f", self.data, effect_ptr + 44)[0]),
+                )
+            )
+        return None
+
+    def _read_texture_name(self, texture_ptr: int) -> str:
+        if texture_ptr <= 0 or texture_ptr + 48 > len(self.data):
+            return ""
+        return _decode_c_string(self.data[texture_ptr + 16: texture_ptr + 48])
+
+    def decode_ipl_files(self, root: Path, ipl_dir: Path) -> tuple[int, int, int, int, int, int]:
+        safe_mkdir(ipl_dir)
+        existing_keys: set[tuple[int, tuple[float, ...]]] = set()
+        existing_positions: set[tuple[int, tuple[float, float, float]]] = set()
+        existing_positions_by_model: dict[int, list[tuple[float, float, float]]] = defaultdict(list)
+        base_model_ids: set[int] = set()
+        buildings = self._write_pool_ipl(
+            ipl_dir / "Buildings.ipl",
+            self.building_pool,
+            existing_keys,
+            existing_positions,
+            existing_positions_by_model,
+            base_model_ids,
+        )
+        treadables = self._write_pool_ipl(
+            ipl_dir / "Treadables.ipl",
+            self.treadable_pool,
+            existing_keys,
+            existing_positions,
+            existing_positions_by_model,
+            base_model_ids,
+        )
+        dummys = self._write_pool_ipl(
+            ipl_dir / "Dummys.ipl",
+            self.dummy_pool,
+            existing_keys,
+            existing_positions,
+            existing_positions_by_model,
+            base_model_ids,
+        )
+        generated_streamed = self._write_streamed_interior_ipl(
+            root,
+            ipl_dir / "wrld_stream.ipl",
+            existing_keys,
+            existing_positions,
+            existing_positions_by_model,
+            base_model_ids,
+        )
+        cull_zones = self._write_cull_ipl(ipl_dir / "cull.ipl")
+        return 5, buildings, treadables, dummys, generated_streamed, cull_zones
+
+    def build_ipl_summary(self) -> IplSummary:
+        summary = IplSummary()
+        self._append_pool_transforms(summary, self.building_pool, "GAME.dat:Buildings.ipl")
+        self._append_pool_transforms(summary, self.treadable_pool, "GAME.dat:Treadables.ipl")
+        self._append_pool_transforms(summary, self.dummy_pool, "GAME.dat:Dummys.ipl")
+        return summary
+
+    def _write_pool_ipl(
+        self,
+        path: Path,
+        pool: PoolInfo,
+        existing_keys: set[tuple[int, tuple[float, ...]]],
+        existing_positions: set[tuple[int, tuple[float, float, float]]],
+        existing_positions_by_model: dict[int, list[tuple[float, float, float]]],
+        base_model_ids: set[int],
+    ) -> int:
         lines = ["# Decoded from GAME.dat", "inst"]
         written = 0
         model_info_by_id = self.model_info_by_id
@@ -272,32 +460,137 @@ class GameDat:
             model = model_info_by_id.get(model_id)
             if model is None:
                 continue
+            if not model.is_map_model:
+                continue
+            base_model_ids.add(model_id)
             matrix = struct.unpack_from("<16f", self.data, entry_ptr)
-            position = matrix[12], matrix[13], matrix[14]
-            rotation = _matrix_to_ipl_quaternion(matrix)
-            lines.append(
-                ", ".join(
-                    (
-                        str(model_id),
-                        model.model_name,
-                        "0",
-                        _format_number(position[0]),
-                        _format_number(position[1]),
-                        _format_number(position[2]),
-                        "1",
-                        "1",
-                        "1",
-                        _format_number(rotation[0]),
-                        _format_number(rotation[1]),
-                        _format_number(rotation[2]),
-                        _format_number(rotation[3]),
-                    )
-                )
-            )
+            transform = _matrix_to_ipl_transform(matrix)
+            if transform is None:
+                continue
+            position, _scale, rotation = transform
+            unit_scale = (1.0, 1.0, 1.0)
+            position_key = (model_id, _ipl_position_key(position))
+            if position_key in existing_positions:
+                continue
+            existing_positions.add(position_key)
+            existing_positions_by_model[model_id].append(position)
+            existing_keys.add((model_id, _ipl_transform_key(position, unit_scale, rotation)))
+            row = _format_ipl_inst_row(model_id, model.model_name, 0, position, unit_scale, rotation)
+            if model.model_name in COMMENTED_MODELS:
+                row = f"# {row}"
+            lines.append(row)
             written += 1
         lines.append("end")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return written
+
+    def _append_pool_transforms(self, summary: IplSummary, pool: PoolInfo, source_file: str) -> None:
+        model_info_by_id = self.model_info_by_id
+        inst_count = 0
+        for index in range(pool.size):
+            if self._pool_slot_free(pool, index):
+                continue
+            entry_ptr = pool.entries_ptr + (index * ENTITY_ENTRY_SIZE)
+            model_id = self._s16(entry_ptr + ENTITY_MODEL_INDEX_OFFSET)
+            if model_id < 0:
+                continue
+            model = model_info_by_id.get(model_id)
+            if model is None or not model.is_map_model:
+                continue
+            matrix = struct.unpack_from("<16f", self.data, entry_ptr)
+            transform = _matrix_to_ipl_transform(matrix)
+            if transform is None:
+                continue
+            position, _scale, rotation = transform
+            inst_count += 1
+            ipl_transform = IplTransform(
+                model_id=model_id,
+                model_name=model.model_name,
+                interior=0,
+                position=position,
+                rotation=rotation,
+                source_file=source_file,
+            )
+            summary.transforms_by_model.setdefault(model.model_name.lower(), []).append(ipl_transform)
+            summary.transforms_by_id.setdefault(model_id, []).append(ipl_transform)
+        summary.inst_count_by_file[source_file] = inst_count
+        summary.nonzero_interior_by_file[source_file] = 0
+
+    def _write_streamed_interior_ipl(
+        self,
+        root: Path,
+        path: Path,
+        existing_keys: set[tuple[int, tuple[float, ...]]],
+        existing_positions: set[tuple[int, tuple[float, float, float]]],
+        existing_positions_by_model: dict[int, list[tuple[float, float, float]]],
+        base_model_ids: set[int],
+    ) -> int:
+        lines = ["# Decoded from LVZ/WRLD streamed placements", "inst"]
+        placements: dict[tuple[str, int], tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool]] = {}
+        links = load_streamed_link_table()
+
+        for archive_name in LEVEL_IDS:
+            level = LevelChunk.from_archive(root, archive_name)
+            for visit, pass_index, instance in level.iter_instances():
+                if visit.source_kind not in {"interior", "swap-sector"}:
+                    continue
+                link = links.get(instance.world_id)
+                if link is None:
+                    continue
+                _linked_ipl_id, model_id = link
+                if model_id in base_model_ids:
+                    continue
+                model = self.model_info_by_id.get(model_id)
+                if model is None or not model.is_map_model:
+                    continue
+                absolute_matrix = _matrix_with_origin(instance.matrix, visit.origin)
+                if _matrix_to_ipl_transform(absolute_matrix) is None:
+                    continue
+                key = (archive_name, instance.world_id)
+                candidate = (
+                    model,
+                    0,
+                    absolute_matrix,
+                    pass_index,
+                    visit.source_kind,
+                    visit.sector_id,
+                    visit.visible,
+                )
+                current = placements.get(key)
+                if current is None or _prefer_streamed_placement(candidate, current):
+                    placements[key] = candidate
+
+        for archive_name, world_id in sorted(placements):
+            model, interior_id, matrix, _pass_index, _source_kind, _sector_id, _visible = placements[(archive_name, world_id)]
+            transform = _matrix_to_ipl_transform(matrix)
+            if transform is None:
+                continue
+            position, _scale, rotation = transform
+            unit_scale = (1.0, 1.0, 1.0)
+            position_key = (model.model_id, _ipl_position_key(position))
+            if position_key in existing_positions:
+                continue
+            if _has_nearby_model_position(
+                model.model_id,
+                position,
+                existing_positions_by_model,
+                STREAM_NEAR_DUPLICATE_TOLERANCE,
+            ):
+                continue
+            dedupe_key = (model.model_id, _ipl_transform_key(position, unit_scale, rotation))
+            if dedupe_key in existing_keys:
+                continue
+            existing_positions.add(position_key)
+            existing_positions_by_model[model.model_id].append(position)
+            existing_keys.add(dedupe_key)
+            row = _format_ipl_inst_row(model.model_id, model.model_name, interior_id, position, unit_scale, rotation)
+            if model.model_name in COMMENTED_MODELS:
+                row = f"# {row}"
+            lines.append(row)
+
+        lines.append("end")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return max(0, len(lines) - 3)
 
     def _write_cull_ipl(self, path: Path) -> int:
         lines = ["# Decoded from GAME.dat", "cull"]
@@ -332,16 +625,20 @@ class GameDat:
 
 def decode_game_dat(game_dat_path: Path, output_root: Path) -> GameDatDecodeStats:
     game_dat = GameDat.from_path(game_dat_path)
+    root = game_dat_path.parent
     data_dir = output_root / "data"
-    ide_dir = data_dir / "ide"
-    ipl_dir = data_dir / "ipl"
+    maps_dir = data_dir / "maps"
+    ide_dir = maps_dir
+    ipl_dir = maps_dir
     safe_mkdir(data_dir)
+    safe_mkdir(maps_dir)
     model_infos = game_dat.iter_model_infos()
     ide_files_written, fallback_hash_names = game_dat.decode_ide_files(ide_dir)
-    ipl_files_written, buildings, treadables, dummys, cull_zones = game_dat.decode_ipl_files(ipl_dir)
+    ipl_files_written, buildings, treadables, dummys, generated_streamed, cull_zones = game_dat.decode_ipl_files(root, ipl_dir)
+    _write_gta_dat(data_dir / "gta.dat", maps_dir)
     unsupported_weapons = sum(1 for model in model_infos if model.model_type == MITYPE_WEAPON)
-    unsupported_vehicles = sum(1 for model in model_infos if model.model_type == 6)
-    unsupported_peds = sum(1 for model in model_infos if model.model_type == 7)
+    unsupported_vehicles = sum(1 for model in model_infos if model.model_type == MITYPE_VEHICLE)
+    unsupported_peds = sum(1 for model in model_infos if model.model_type == MITYPE_PED)
     return GameDatDecodeStats(
         model_infos_total=len(model_infos),
         named_model_infos=len(model_infos) - fallback_hash_names,
@@ -351,11 +648,33 @@ def decode_game_dat(game_dat_path: Path, output_root: Path) -> GameDatDecodeStat
         building_instances=buildings,
         treadable_instances=treadables,
         dummy_instances=dummys,
+        generated_streamed_instances=generated_streamed,
         cull_zones=cull_zones,
         unsupported_weapons=unsupported_weapons,
         unsupported_vehicles=unsupported_vehicles,
         unsupported_peds=unsupported_peds,
     )
+
+
+def _write_gta_dat(path: Path, maps_dir: Path) -> None:
+    ide_files = sorted(maps_dir.glob("*.ide"))
+    ipl_files = sorted(maps_dir.glob("*.ipl"))
+    lines = [
+        "#",
+        "# Object types",
+        "#",
+    ]
+    lines.extend(f"IDE Data/Maps/{ide_path.name}" for ide_path in ide_files)
+    lines.extend(
+        (
+            "",
+            "#",
+            "# Scene information",
+            "#",
+        )
+    )
+    lines.extend(f"IPL Data/Maps/{ipl_path.name}" for ipl_path in ipl_files)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _decode_c_string(raw: bytes) -> str:
@@ -373,6 +692,71 @@ def _format_number(value: float) -> str:
         text = f"{value:.6f}".rstrip("0").rstrip(".")
         return text if text not in {"-0", ""} else "0"
     return "0"
+
+
+def _format_ipl_inst_row(
+    model_id: int,
+    model_name: str,
+    interior: int,
+    position: tuple[float, float, float],
+    scale: tuple[float, float, float],
+    rotation: tuple[float, float, float, float],
+) -> str:
+    return ", ".join(
+        (
+            str(model_id),
+            model_name,
+            str(interior),
+            _format_number(position[0]),
+            _format_number(position[1]),
+            _format_number(position[2]),
+            _format_number(scale[0]),
+            _format_number(scale[1]),
+            _format_number(scale[2]),
+            _format_number(rotation[0]),
+            _format_number(rotation[1]),
+            _format_number(rotation[2]),
+            _format_number(rotation[3]),
+        )
+    )
+
+
+def _matrix_with_origin(matrix: tuple[float, ...], origin: tuple[float, float, float]) -> tuple[float, ...]:
+    adjusted = list(matrix)
+    adjusted[12] += origin[0]
+    adjusted[13] += origin[1]
+    adjusted[14] += origin[2]
+    return tuple(adjusted)
+
+
+def _matrix_to_ipl_transform(
+    matrix: tuple[float, ...],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float, float]] | None:
+    position = (matrix[12], matrix[13], matrix[14])
+    rows = (
+        (matrix[0], matrix[1], matrix[2]),
+        (matrix[4], matrix[5], matrix[6]),
+        (matrix[8], matrix[9], matrix[10]),
+    )
+    if not all(math.isfinite(value) and abs(value) < 1e8 for value in (*position, *rows[0], *rows[1], *rows[2])):
+        return None
+
+    scales: list[float] = []
+    normalized_rows: list[tuple[float, float, float]] = []
+    for row in rows:
+        length = math.sqrt(sum(component * component for component in row))
+        if not math.isfinite(length) or length <= 1e-8 or length > 1e8:
+            return None
+        scales.append(length)
+        normalized_rows.append(tuple(component / length for component in row))
+
+    normalized_matrix = (
+        normalized_rows[0][0], normalized_rows[0][1], normalized_rows[0][2], 0.0,
+        normalized_rows[1][0], normalized_rows[1][1], normalized_rows[1][2], 0.0,
+        normalized_rows[2][0], normalized_rows[2][1], normalized_rows[2][2], 0.0,
+        position[0], position[1], position[2], 1.0,
+    )
+    return position, (scales[0], scales[1], scales[2]), _matrix_to_ipl_quaternion(normalized_matrix)
 
 
 def _matrix_to_ipl_quaternion(matrix: tuple[float, ...]) -> tuple[float, float, float, float]:
@@ -411,3 +795,48 @@ def _matrix_to_ipl_quaternion(matrix: tuple[float, ...]) -> tuple[float, float, 
 
     values = (-x, -y, -z, w)
     return tuple(0.0 if abs(value) < 1e-8 else value for value in values)
+
+
+def _prefer_streamed_placement(
+    candidate: tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool],
+    current: tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool],
+) -> bool:
+    return (
+        SOURCE_PRIORITY[candidate[4]],
+        candidate[3],
+        candidate[5],
+        not candidate[6],
+    ) < (
+        SOURCE_PRIORITY[current[4]],
+        current[3],
+        current[5],
+        not current[6],
+    )
+
+
+def _ipl_transform_key(
+    position: tuple[float, float, float],
+    scale: tuple[float, float, float],
+    rotation: tuple[float, float, float, float],
+) -> tuple[float, ...]:
+    return tuple(round(value, 5) for value in (*position, *scale, *rotation))
+
+
+def _ipl_position_key(position: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(round(value, 5) for value in position)
+
+
+def _has_nearby_model_position(
+    model_id: int,
+    position: tuple[float, float, float],
+    positions_by_model: dict[int, list[tuple[float, float, float]]],
+    tolerance: float,
+) -> bool:
+    tolerance_sq = tolerance * tolerance
+    for existing in positions_by_model.get(model_id, ()):
+        dx = position[0] - existing[0]
+        dy = position[1] - existing[1]
+        dz = position[2] - existing[2]
+        if (dx * dx) + (dy * dy) + (dz * dz) <= tolerance_sq:
+            return True
+    return False

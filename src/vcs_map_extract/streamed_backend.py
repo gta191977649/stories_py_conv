@@ -748,6 +748,9 @@ def _find_nearest_ipl_transform(
     candidates = ipl_summary.transforms_by_model.get(model_name.lower(), [])
     if not candidates:
         return None
+    game_dat_candidates = [candidate for candidate in candidates if candidate.source_file.startswith("GAME.dat:")]
+    if game_dat_candidates:
+        candidates = game_dat_candidates
     anchor = _placement_translation(placements[0].matrix)
     best: IplTransform | None = None
     best_dist = float("inf")
