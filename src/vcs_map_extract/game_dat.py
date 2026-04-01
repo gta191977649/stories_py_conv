@@ -529,8 +529,21 @@ class GameDat:
         base_model_ids: set[int],
     ) -> int:
         lines = ["# Decoded from LVZ/WRLD streamed placements", "inst"]
-        placements: dict[tuple[str, int], tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool]] = {}
+        placements: dict[
+            tuple[str, int],
+            tuple[
+                GameDatModelInfo,
+                int,
+                tuple[float, float, float],
+                tuple[float, float, float, float],
+                int,
+                str,
+                int,
+                bool,
+            ],
+        ] = {}
         links = load_streamed_link_table()
+        entity_transforms = self.build_ipl_summary().transforms_by_entity_id
 
         for archive_name in LEVEL_IDS:
             level = LevelChunk.from_archive(root, archive_name)
@@ -546,14 +559,22 @@ class GameDat:
                 model = self.model_info_by_id.get(model_id)
                 if model is None or not model.is_map_model:
                     continue
-                absolute_matrix = _matrix_with_origin(instance.matrix, visit.origin)
-                if _matrix_to_ipl_transform(absolute_matrix) is None:
-                    continue
+                exact_transform = entity_transforms.get(_linked_ipl_id)
+                if exact_transform is not None:
+                    position = exact_transform.position
+                    rotation = exact_transform.rotation
+                else:
+                    absolute_matrix = _matrix_with_origin(instance.matrix, visit.origin)
+                    transform = _matrix_to_ipl_transform(absolute_matrix)
+                    if transform is None:
+                        continue
+                    position, _scale, rotation = transform
                 key = (archive_name, instance.world_id)
                 candidate = (
                     model,
                     0,
-                    absolute_matrix,
+                    position,
+                    rotation,
                     pass_index,
                     visit.source_kind,
                     visit.sector_id,
@@ -564,11 +585,7 @@ class GameDat:
                     placements[key] = candidate
 
         for archive_name, world_id in sorted(placements):
-            model, interior_id, matrix, _pass_index, _source_kind, _sector_id, _visible = placements[(archive_name, world_id)]
-            transform = _matrix_to_ipl_transform(matrix)
-            if transform is None:
-                continue
-            position, _scale, rotation = transform
+            model, interior_id, position, rotation, _pass_index, _source_kind, _sector_id, _visible = placements[(archive_name, world_id)]
             unit_scale = (1.0, 1.0, 1.0)
             position_key = (model.model_id, _ipl_position_key(position))
             if position_key in existing_positions:
@@ -801,19 +818,19 @@ def _matrix_to_ipl_quaternion(matrix: tuple[float, ...]) -> tuple[float, float, 
 
 
 def _prefer_streamed_placement(
-    candidate: tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool],
-    current: tuple[GameDatModelInfo, int, tuple[float, ...], int, str, int, bool],
+    candidate: tuple[GameDatModelInfo, int, tuple[float, float, float], tuple[float, float, float, float], int, str, int, bool],
+    current: tuple[GameDatModelInfo, int, tuple[float, float, float], tuple[float, float, float, float], int, str, int, bool],
 ) -> bool:
     return (
-        SOURCE_PRIORITY[candidate[4]],
-        candidate[3],
-        candidate[5],
-        not candidate[6],
+        SOURCE_PRIORITY[candidate[5]],
+        candidate[4],
+        candidate[6],
+        not candidate[7],
     ) < (
-        SOURCE_PRIORITY[current[4]],
-        current[3],
-        current[5],
-        not current[6],
+        SOURCE_PRIORITY[current[5]],
+        current[4],
+        current[6],
+        not current[7],
     )
 
 
