@@ -428,7 +428,7 @@ use (x, y, z, w)
 do not negate xyz
 ```
 
-Negating `x/y/z` makes some objects appear to have the correct position but the wrong heading. `JM_marinex` was the sanity-check model that exposed this issue: the old quaternion sign convention reconstructed a rotated anchor, while the corrected convention reduced the residual local transform to scale-only as expected.
+Negating `x/y/z` makes some objects appear to have the correct position but the wrong heading. For instance `JM_marinex` was the sanity-check model that exposed this issue: the old quaternion sign convention reconstructed a rotated anchor, while the corrected convention reduced the residual local transform to scale-only as expected.
 
 #### Sanity checks for developers
 
