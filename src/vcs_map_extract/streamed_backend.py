@@ -70,6 +70,7 @@ class TriStrip:
     count: int
     verts: list[tuple[float, float, float]]
     uvs: list[tuple[float, float]]
+    colors: list[tuple[int, int, int, int]] | None = None
     material_res_index: int = -1
 
 
@@ -85,6 +86,7 @@ class ParsedStreamedGeometry:
     vertices: list[tuple[float, float, float]]
     faces: list[tuple[int, int, int]]
     uvs: list[tuple[float, float]]
+    vertex_colors: list[tuple[int, int, int, int]]
     face_texture_res_ids: list[int]
     resource_origin: str
 
@@ -152,18 +154,22 @@ def _triangulate_strip_faces(
     return faces
 
 
-def _iter_stitched_strip_runs(strips: list[TriStrip]) -> list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], int]]:
-    runs: list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], int]] = []
+def _iter_stitched_strip_runs(
+    strips: list[TriStrip],
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], list[tuple[int, int, int, int]], int]]:
+    runs: list[tuple[list[tuple[float, float, float]], list[tuple[float, float]], list[tuple[int, int, int, int]], int]] = []
     current_verts: list[tuple[float, float, float]] = []
     current_uvs: list[tuple[float, float]] = []
+    current_colors: list[tuple[int, int, int, int]] = []
     current_material = -1
 
     def flush() -> None:
-        nonlocal current_verts, current_uvs, current_material
+        nonlocal current_verts, current_uvs, current_colors, current_material
         if len(current_verts) >= 3:
-            runs.append((current_verts, current_uvs, current_material))
+            runs.append((current_verts, current_uvs, current_colors, current_material))
         current_verts = []
         current_uvs = []
+        current_colors = []
         current_material = -1
 
     for strip in strips:
@@ -172,20 +178,28 @@ def _iter_stitched_strip_runs(strips: list[TriStrip]) -> list[tuple[list[tuple[f
             continue
         strip_verts = strip.verts[:count]
         strip_uvs = strip.uvs[:count]
+        strip_src_colors = strip.colors or []
+        strip_colors = [
+            strip_src_colors[index] if index < len(strip_src_colors) else (255, 255, 255, 255)
+            for index in range(count)
+        ]
         material = strip.material_res_index if strip.material_res_index >= 0 else -1
         if not current_verts:
             current_verts = list(strip_verts)
             current_uvs = list(strip_uvs)
+            current_colors = list(strip_colors)
             current_material = material
             continue
         if material != current_material:
             flush()
             current_verts = list(strip_verts)
             current_uvs = list(strip_uvs)
+            current_colors = list(strip_colors)
             current_material = material
             continue
         current_verts.extend(strip_verts)
         current_uvs.extend(strip_uvs)
+        current_colors.extend(strip_colors)
     flush()
     return runs
 
@@ -342,6 +356,15 @@ class LVZArchive:
     def _read_uv(self, blob: bytes, offset: int) -> tuple[float, float]:
         return (blob[offset + 0] / 128.0, blob[offset + 1] / 128.0)
 
+    def _read_prelight(self, blob: bytes, offset: int) -> tuple[int, int, int, int]:
+        color = struct.unpack_from("<H", blob, offset)[0]
+        return (
+            (color & 0x1F) * 255 // 0x1F,
+            ((color >> 5) & 0x1F) * 255 // 0x1F,
+            ((color >> 10) & 0x1F) * 255 // 0x1F,
+            0xFF if (color & 0x8000) else 0,
+        )
+
     def _parse_one_batch(self, blob: bytes, pos: int, *, first_batch: bool) -> tuple[TriStrip, int]:
         pos = self._find_unpack_near(blob, align_down4(pos))
         if pos + 20 > len(blob):
@@ -380,6 +403,7 @@ class LVZArchive:
             raise ValueError("Unexpected prelight header")
         if w + 4 + (count_all * 2) > len(blob):
             raise ValueError("Prelight payload truncated")
+        colors = [self._read_prelight(blob, w + 4 + ((index + skip) * 2)) for index in range(count)]
         w = align_up4(w + 4 + (count_all * 2))
         if read_u32(blob, w) != MSCAL:
             if w + 4 <= len(blob) and read_u32(blob, w + 4) == MSCAL:
@@ -389,7 +413,7 @@ class LVZArchive:
         w += 4
         while w + 4 <= len(blob) and read_u32(blob, w) == 0:
             w += 4
-        return TriStrip(count=count, verts=verts, uvs=uvs), w
+        return TriStrip(count=count, verts=verts, uvs=uvs, colors=colors), w
 
     def _parse_groups(self, blob: bytes, start_off: int) -> list[StripGroup]:
         groups: list[StripGroup] = []
@@ -459,6 +483,7 @@ class LVZArchive:
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
+        vertex_colors: list[tuple[int, int, int, int]] = []
         face_texture_res_ids: list[int] = []
 
         cursor = data_start
@@ -477,17 +502,18 @@ class LVZArchive:
                     strip.material_res_index = mesh.texture_id
                     strip.uvs = [(u * mesh.u_scale, v * mesh.v_scale) for u, v in strip.uvs]
                     packet_strips.append(strip)
-            for strip_verts, strip_uvs, material_res_index in _iter_stitched_strip_runs(packet_strips):
+            for strip_verts, strip_uvs, strip_colors, material_res_index in _iter_stitched_strip_runs(packet_strips):
                 base = len(vertices)
                 vertices.extend(strip_verts)
                 uvs.extend(strip_uvs)
+                vertex_colors.extend(strip_colors)
                 for face in _triangulate_strip_faces(strip_verts, base_index=base, uvs=strip_uvs):
                     faces.append(face)
                     face_texture_res_ids.append(material_res_index)
 
         if not faces:
             return None
-        return ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids, origin)
+        return ParsedStreamedGeometry(vertices, faces, uvs, vertex_colors, face_texture_res_ids, origin)
 
     def _assign_materials(self, materials: list[MDLMaterial], groups: list[StripGroup]) -> None:
         if not materials or not groups:
@@ -520,18 +546,20 @@ class LVZArchive:
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
+        vertex_colors: list[tuple[int, int, int, int]] = []
         face_texture_res_ids: list[int] = []
         stitched_runs = _iter_stitched_strip_runs([strip for group in groups for strip in group.strips])
-        for strip_verts, strip_uvs, material_res_index in stitched_runs:
+        for strip_verts, strip_uvs, strip_colors, material_res_index in stitched_runs:
             base = len(vertices)
             vertices.extend(strip_verts)
             uvs.extend(strip_uvs)
+            vertex_colors.extend(strip_colors)
             for face in _triangulate_strip_faces(strip_verts, base_index=base, uvs=strip_uvs):
                 faces.append(face)
                 face_texture_res_ids.append(material_res_index)
         if not faces:
             return None
-        return ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids, origin)
+        return ParsedStreamedGeometry(vertices, faces, uvs, vertex_colors, face_texture_res_ids, origin)
 
     def _parse_embedded_unpack_geometry(self, blob: bytes, origin: str) -> ParsedStreamedGeometry | None:
         marker = struct.pack("<I", UNPACK)
@@ -550,6 +578,7 @@ class LVZArchive:
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
+        vertex_colors: list[tuple[int, int, int, int]] = []
         face_texture_res_ids: list[int] = []
         first_batch = True
 
@@ -572,15 +601,20 @@ class LVZArchive:
             if w + (count_all * 6) > len(blob):
                 break
             batch_vertices = [self._read_vec3_i16_norm(blob, w + ((index + skip) * 6)) for index in range(count)]
+            w = align_up4(w + (count_all * 6))
+            batch_uvs = [(0.0, 0.0)] * count
+            if (read_u32(blob, w) & 0xFF004000) != 0x6F000000:
+                break
+            batch_colors = [self._read_prelight(blob, w + 4 + ((index + skip) * 2)) for index in range(count)]
             base = len(vertices)
             vertices.extend(batch_vertices)
-            batch_uvs = [(0.0, 0.0)] * count
             uvs.extend(batch_uvs)
+            vertex_colors.extend(batch_colors)
             for face in _triangulate_strip_faces(batch_vertices, base_index=base, uvs=batch_uvs):
                 faces.append(face)
                 face_texture_res_ids.append(-1)
 
-            next_search = align_up4(w + (count_all * 6))
+            next_search = align_up4(w + 4 + (count_all * 2))
             try:
                 off = self._find_unpack_near(blob, next_search)
             except ValueError:
@@ -589,7 +623,7 @@ class LVZArchive:
 
         if not faces:
             return None
-        return ParsedStreamedGeometry(vertices, faces, uvs, face_texture_res_ids, origin)
+        return ParsedStreamedGeometry(vertices, faces, uvs, vertex_colors, face_texture_res_ids, origin)
 
     def geometry_for_res_id(self, res_id: int) -> ParsedStreamedGeometry | None:
         if res_id in self.geometry_cache:
@@ -812,8 +846,8 @@ def export_streamed_archive(
     salvaged_models = 0
     interior_models_exported = 0
     interior_named_exports = 0
-    interior_fallback_exports = 0
-    interior_variant_exports = 0
+    interior_unresolved_skips = 0
+    interior_conflict_skips = 0
     interior_texture_names_recovered_ids: set[int] = set()
     interior_texture_names_fallback_ids: set[int] = set()
     exported_signatures_by_name: dict[str, set[str]] = {}
@@ -836,6 +870,7 @@ def export_streamed_archive(
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
         uvs: list[tuple[float, float]] = []
+        vertex_colors: list[tuple[int, int, int, int]] = []
         face_materials: list[str] = []
         seen_fragments: set[tuple[int, int, int]] = set()
         used_resource_origins: set[str] = set()
@@ -900,6 +935,10 @@ def export_streamed_archive(
                 base_index = len(vertices)
                 vertices.extend(transformed_vertices)
                 uvs.extend(geometry.uvs)
+                if geometry.vertex_colors and len(geometry.vertex_colors) == len(geometry.vertices):
+                    vertex_colors.extend(geometry.vertex_colors)
+                else:
+                    vertex_colors.extend([(255, 255, 255, 255)] * len(geometry.vertices))
                 used_resource_origins.add(geometry.resource_origin)
                 used_source_kinds.add(placement.source_kind)
                 for face_index, (a, b, c) in enumerate(geometry.faces):
@@ -914,8 +953,6 @@ def export_streamed_archive(
                         else:
                             interior_texture_names_fallback_ids.add(texture_res_id)
                     effective_txd_name = model.txd_name
-                    if not effective_txd_name and model.export_kind == "interior_fallback":
-                        effective_txd_name = "interior_generic"
                     if texture is not None and effective_txd_name:
                         txd_bucket = textures_by_txd.setdefault(effective_txd_name, {})
                         existing = txd_bucket.get(texture_name)
@@ -937,7 +974,13 @@ def export_streamed_archive(
                 break
 
         if faces:
-            mesh = MeshData(vertices=vertices, faces=faces, uvs=uvs, face_materials=face_materials)
+            mesh = MeshData(
+                vertices=vertices,
+                faces=faces,
+                uvs=uvs,
+                face_materials=face_materials,
+                vertex_colors=vertex_colors,
+            )
             base_stem = sanitize_filename(model.output_name or model.model_name)
             export_signature = _geometry_signature(seen_fragments)
             output_stem = base_stem
@@ -949,20 +992,21 @@ def export_streamed_archive(
                     )
                     continue
                 if base_stem in used_output_stems:
-                    variant_name = f"{model.model_name}__int_{model.placements[0].sector_id}"
-                    output_stem = _unique_stem(variant_name, used_output_stems, fallback_suffix=f"_r{model.placements[0].res_id}")
-                    interior_variant_exports += 1
                     diagnostics.append(
-                        f"{archive_name}: wrote interior variant {output_stem} for {model.model_name} due to world/interior geometry mismatch"
+                        f"{archive_name}: skipped interior export for {model.model_name} from sector={model.placements[0].sector_id}, "
+                        f"res_id={model.placements[0].res_id} because only exact IDE model names are allowed in main output"
                     )
+                    interior_conflict_skips += 1
+                    continue
                 else:
                     interior_named_exports += 1
             elif model.export_kind == "interior_fallback":
-                output_stem = _unique_stem(model.output_name or model.model_name, used_output_stems, fallback_suffix=f"_r{model.placements[0].res_id}")
-                interior_fallback_exports += 1
                 diagnostics.append(
-                    f"{archive_name}: exported fallback interior model {output_stem} from sector={model.placements[0].sector_id}, res_id={model.placements[0].res_id}"
+                    f"{archive_name}: skipped unresolved interior resource from sector={model.placements[0].sector_id}, "
+                    f"res_id={model.placements[0].res_id} because no IDE model name was resolved"
                 )
+                interior_unresolved_skips += 1
+                continue
             else:
                 if export_signature in existing_signatures:
                     diagnostics.append(
@@ -1000,10 +1044,6 @@ def export_streamed_archive(
             existing_signatures.add(export_signature)
             if model.export_kind.startswith("interior"):
                 interior_models_exported += 1
-                if not model.txd_name and any(face_materials):
-                    diagnostics.append(
-                        f"{archive_name}: mapped {output_stem} textures into interior_generic.txd due to missing IDE TXD name"
-                    )
             if model.has_hidden_alternates and visible_placements and hidden_placements:
                 models_with_hidden_conflicts += 1
                 diagnostics.append(
@@ -1055,8 +1095,8 @@ def export_streamed_archive(
         "salvaged_models": salvaged_models,
         "interior_models_exported": interior_models_exported,
         "interior_named_exports": interior_named_exports,
-        "interior_fallback_exports": interior_fallback_exports,
-        "interior_variant_exports": interior_variant_exports,
+        "interior_unresolved_skips": interior_unresolved_skips,
+        "interior_conflict_skips": interior_conflict_skips,
         "interior_texture_names_recovered": len(interior_texture_names_recovered_ids),
         "interior_texture_names_fallback": len(interior_texture_names_fallback_ids),
         "exported_txds": sum(1 for txd_name, textures in textures_by_txd.items() if textures and txd_name.lower() != "knackers"),

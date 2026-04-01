@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out\n"
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out\n"
+            "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --decode-dat\n"
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out --packimg"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -25,13 +26,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pack generated dff/txd/col outputs into OUTPUT/vcs_map.img",
     )
+    parser.add_argument(
+        "--decode-dat",
+        action="store_true",
+        help="Decode GAME.dat into OUTPUT/data/ide and OUTPUT/data/ipl, then exit",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return run(args.input, args.output, args.packimg)
+    return run(args.input, args.output, args.packimg, args.decode_dat)
 
 
 if __name__ == "__main__":

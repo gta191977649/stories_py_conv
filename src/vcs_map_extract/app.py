@@ -4,19 +4,21 @@ import shutil
 import tempfile
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .constants import ARCHIVE_ORDER, EXPECTED_FILES, STANDARD_ARCHIVES, STREAMED_ARCHIVES
+from .game_dat import decode_game_dat
 from .ide_catalog import parse_ide_directory
 from .img_io import ImgDirectoryEntry, ImgReader
 from .ipl_parser import parse_ipl_directory
 from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import write_packed_img
-from .pure_backend import DecodedTexture, run_conversion_jobs, write_txd_from_decoded_textures
 from .report import write_report
-from .streamed_backend import export_streamed_archive
-from .streamed_world import plan_streamed_archive
 from .utils import normalize_input_root, safe_mkdir, sanitize_filename
+
+if TYPE_CHECKING:
+    from .pure_backend import DecodedTexture
 
 
 TEXTURE_EXTENSIONS = (".xtx", ".tex", ".chk")
@@ -33,6 +35,13 @@ def _validate_root(root: Path) -> None:
         for name in names:
             if not (root / name).exists():
                 raise FileNotFoundError(f"Missing required {archive_name} input file: {root / name}")
+
+
+def _validate_game_dat(root: Path) -> Path:
+    game_dat_path = root / "GAME.dat"
+    if not game_dat_path.is_file():
+        raise FileNotFoundError(f"Missing required GAME.dat input file: {game_dat_path}")
+    return game_dat_path
 
 
 def _collect_standard_entries(root: Path, archive_name: str) -> tuple[ImgReader, dict[str, ImgDirectoryEntry]]:
@@ -135,15 +144,55 @@ def _ensure_knackers_txd(output_root: Path) -> None:
     target.write_bytes(b"")
 
 
-def run(input_path: str, output_path: str, packimg: bool) -> int:
+def _cleanup_stale_generated_outputs(output_root: Path) -> None:
+    for archive_name in STREAMED_ARCHIVES:
+        archive_dir = output_root / archive_name
+        for path in archive_dir.glob("*__int_*.*"):
+            if path.is_file():
+                path.unlink()
+        for path in archive_dir.glob("interior_*.*"):
+            if path.is_file():
+                path.unlink()
+        stale_interior_generic = archive_dir / "interior_generic.txd"
+        if stale_interior_generic.exists():
+            stale_interior_generic.unlink()
+
+
+def run(input_path: str, output_path: str, packimg: bool, decode_dat: bool = False) -> int:
     root = normalize_input_root(input_path)
     output_root = Path(output_path).expanduser().resolve()
     _log(f"[run] input={root}")
     _log(f"[run] output={output_root}")
-    _validate_root(root)
     safe_mkdir(output_root)
+    if decode_dat:
+        game_dat_path = _validate_game_dat(root)
+        _log(f"[decode-dat] decoding {game_dat_path}")
+        stats = decode_game_dat(game_dat_path, output_root)
+        _log(
+            "[decode-dat] wrote "
+            f"{stats.ide_files_written} ide files, {stats.ipl_files_written} ipl files, "
+            f"{stats.model_infos_total} model infos ({stats.fallback_hash_names} hash fallbacks)"
+        )
+        _log(
+            "[decode-dat] instances: "
+            f"buildings={stats.building_instances}, treadables={stats.treadable_instances}, "
+            f"dummys={stats.dummy_instances}, cull_zones={stats.cull_zones}"
+        )
+        if stats.unsupported_weapons or stats.unsupported_vehicles or stats.unsupported_peds:
+            _log(
+                "[decode-dat] skipped unsupported non-map sections: "
+                f"weapons={stats.unsupported_weapons}, vehicles={stats.unsupported_vehicles}, peds={stats.unsupported_peds}"
+            )
+        return 0
+
+    _validate_root(root)
+    from .pure_backend import run_conversion_jobs, write_txd_from_decoded_textures
+    from .streamed_backend import export_streamed_archive
+    from .streamed_world import plan_streamed_archive
+
     for archive_name in ARCHIVE_ORDER:
         safe_mkdir(output_root / archive_name)
+    _cleanup_stale_generated_outputs(output_root)
     for archive_name in STREAMED_ARCHIVES:
         stale_knackers = output_root / archive_name / "knackers.txd"
         if stale_knackers.exists():
@@ -182,7 +231,7 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
         summary[archive_name].update(plan.summary)
         report.unresolved_streamed_names.extend(plan.unresolved_names)
 
-    global_knackers_textures: dict[str, DecodedTexture] = {}
+    global_knackers_textures: dict[str, "DecodedTexture"] = {}
     for plan in streamed_plans:
         archive_name = plan.archive_name
         if not plan.model_exports and not plan.txd_exports:
@@ -231,7 +280,7 @@ def run(input_path: str, output_path: str, packimg: bool) -> int:
         model.model_name
         for model in ide_catalog.values()
         if not any(
-            sanitize_filename(model.model_name) == stem or stem.startswith(f"{sanitize_filename(model.model_name)}__int_")
+            sanitize_filename(model.model_name) == stem
             for archive in ARCHIVE_ORDER
             for stem in exported_stems_by_archive[archive]
         )

@@ -48,6 +48,7 @@ class MeshData:
     faces: list[tuple[int, int, int]]
     uvs: list[tuple[float, float]]
     face_materials: list[str]
+    vertex_colors: list[tuple[int, int, int, int]] | None = None
 
 
 def _sanitize_texture_name(name: str) -> str:
@@ -293,6 +294,8 @@ def write_dff_from_mesh(mesh: MeshData, output_path: Path, frame_name: str) -> N
     geometry.vertices = [dragon_dff.Vector(*vertex) for vertex in mesh.vertices]
     geometry.normals = [dragon_dff.Vector(*normal) for normal in normals]
     geometry.uv_layers = [[dragon_dff.TexCoords(float(u), float(v)) for u, v in mesh.uvs]]
+    if mesh.vertex_colors and len(mesh.vertex_colors) == len(mesh.vertices):
+        geometry.prelit_colors = [dragon_dff.RGBA(*color) for color in mesh.vertex_colors]
     geometry.triangles = [
         dragon_dff.Triangle(b, a, material_slot.get(mesh.face_materials[index], 0), c)
         for index, (a, b, c) in enumerate(mesh.faces)
@@ -337,6 +340,7 @@ def write_dff(input_path: Path, output_path: Path) -> None:
     faces: list[tuple[int, int, int]] = []
     triangles = []
     uvs = []
+    vertex_colors: list[tuple[int, int, int, int]] = []
 
     for part in geo.parts:
         base_index = len(vertices)
@@ -350,6 +354,14 @@ def write_dff(input_path: Path, output_path: Path) -> None:
             else:
                 u, v = 0.0, 0.0
             uvs.append(dragon_dff.TexCoords(float(u), 1.0 - float(v)))
+
+        part_colors = list(getattr(part, "vertex_colors", []))
+        for vertex_index in range(len(part_vertices)):
+            if vertex_index < len(part_colors):
+                r, g, b, a = part_colors[vertex_index]
+                vertex_colors.append((int(r), int(g), int(b), int(a)))
+            else:
+                vertex_colors.append((255, 255, 255, 255))
 
         material_index = int(getattr(part, "material_id", 0))
         for face in part.faces:
@@ -365,6 +377,7 @@ def write_dff(input_path: Path, output_path: Path) -> None:
             getattr(geo.materials[triangle.material], "texture", "") if triangle.material < len(geo.materials) else ""
             for triangle in triangles
         ],
+        vertex_colors=vertex_colors,
     )
     write_dff_from_mesh(mesh, output_path, sanitize_filename(input_path.stem))
 
