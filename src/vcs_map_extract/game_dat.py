@@ -813,7 +813,7 @@ def _matrix_to_ipl_quaternion(matrix: tuple[float, ...]) -> tuple[float, float, 
         z = sq * 0.5
         w = rp * (m01 - m10)
 
-    values = (-x, -y, -z, w)
+    values = (x, y, z, w)
     return tuple(0.0 if abs(value) < 1e-8 else value for value in values)
 
 
