@@ -13,6 +13,7 @@ class IplTransform:
     position: tuple[float, float, float]
     rotation: tuple[float, float, float, float]
     source_file: str
+    entity_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class IplSummary:
     nonzero_instances: list[IplInstance] = field(default_factory=list)
     transforms_by_model: dict[str, list[IplTransform]] = field(default_factory=dict)
     transforms_by_id: dict[int, list[IplTransform]] = field(default_factory=dict)
+    transforms_by_entity_id: dict[int, IplTransform] = field(default_factory=dict)
 
 
 def _parse_float(value: str) -> float | None:
@@ -121,4 +123,5 @@ def merge_ipl_summaries(*summaries: IplSummary) -> IplSummary:
             merged.transforms_by_model.setdefault(model_name, []).extend(transforms)
         for model_id, transforms in summary.transforms_by_id.items():
             merged.transforms_by_id.setdefault(model_id, []).extend(transforms)
+        merged.transforms_by_entity_id.update(summary.transforms_by_entity_id)
     return merged

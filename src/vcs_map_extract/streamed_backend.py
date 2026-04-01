@@ -738,6 +738,19 @@ def _placement_translation(values: tuple[float, ...]) -> tuple[float, float, flo
     return (float(matrix[0, 3]), float(matrix[1, 3]), float(matrix[2, 3]))
 
 
+def _find_linked_ipl_transform(
+    placements: list[StreamedPlacement],
+    ipl_summary: IplSummary | None,
+) -> IplTransform | None:
+    if ipl_summary is None:
+        return None
+    linked_ids = {placement.linked_ipl_id for placement in placements if placement.linked_ipl_id is not None}
+    if len(linked_ids) != 1:
+        return None
+    linked_id = next(iter(linked_ids))
+    return ipl_summary.transforms_by_entity_id.get(linked_id)
+
+
 def _find_nearest_ipl_transform(
     model_name: str,
     placements: list[StreamedPlacement],
@@ -883,15 +896,21 @@ def export_streamed_archive(
 
         localize_inverse: np.ndarray
         base_inverse, base_placement = choose_base_transform(visible_placements or hidden_placements)
-        matched_ipl = None
-        if model.export_kind == "world_named":
-            matched_ipl = _find_nearest_ipl_transform(model.model_name, visible_placements or hidden_placements, ipl_summary)
-        if matched_ipl is not None:
-            localize_inverse = np.linalg.inv(_ipl_matrix(matched_ipl))
-            diagnostics.append(
-                f"{archive_name}: localized {model.output_name} against IPL transform from {matched_ipl.source_file} "
-                f"at ({matched_ipl.position[0]:.3f}, {matched_ipl.position[1]:.3f}, {matched_ipl.position[2]:.3f})"
-            )
+        anchor_ipl = _find_linked_ipl_transform(visible_placements or hidden_placements, ipl_summary)
+        if anchor_ipl is None and model.export_kind == "world_named":
+            anchor_ipl = _find_nearest_ipl_transform(model.model_name, visible_placements or hidden_placements, ipl_summary)
+        if anchor_ipl is not None:
+            localize_inverse = np.linalg.inv(_ipl_matrix(anchor_ipl))
+            if anchor_ipl.entity_id is not None:
+                diagnostics.append(
+                    f"{archive_name}: localized {model.output_name} against linked entity 0x{anchor_ipl.entity_id:X} "
+                    f"from {anchor_ipl.source_file} at ({anchor_ipl.position[0]:.3f}, {anchor_ipl.position[1]:.3f}, {anchor_ipl.position[2]:.3f})"
+                )
+            else:
+                diagnostics.append(
+                    f"{archive_name}: localized {model.output_name} against IPL transform from {anchor_ipl.source_file} "
+                    f"at ({anchor_ipl.position[0]:.3f}, {anchor_ipl.position[1]:.3f}, {anchor_ipl.position[2]:.3f})"
+                )
         else:
             localize_inverse = base_inverse
             if base_placement is None:

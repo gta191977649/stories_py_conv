@@ -433,9 +433,9 @@ class GameDat:
 
     def build_ipl_summary(self) -> IplSummary:
         summary = IplSummary()
-        self._append_pool_transforms(summary, self.building_pool, "GAME.dat:Buildings.ipl")
-        self._append_pool_transforms(summary, self.treadable_pool, "GAME.dat:Treadables.ipl")
-        self._append_pool_transforms(summary, self.dummy_pool, "GAME.dat:Dummys.ipl")
+        self._append_pool_transforms(summary, self.building_pool, "GAME.dat:Buildings.ipl", 0)
+        self._append_pool_transforms(summary, self.treadable_pool, "GAME.dat:Treadables.ipl", 1 << 16)
+        self._append_pool_transforms(summary, self.dummy_pool, "GAME.dat:Dummys.ipl", 2 << 16)
         return summary
 
     def _write_pool_ipl(
@@ -484,7 +484,7 @@ class GameDat:
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return written
 
-    def _append_pool_transforms(self, summary: IplSummary, pool: PoolInfo, source_file: str) -> None:
+    def _append_pool_transforms(self, summary: IplSummary, pool: PoolInfo, source_file: str, entity_id_prefix: int) -> None:
         model_info_by_id = self.model_info_by_id
         inst_count = 0
         for index in range(pool.size):
@@ -503,6 +503,7 @@ class GameDat:
                 continue
             position, _scale, rotation = transform
             inst_count += 1
+            entity_id = entity_id_prefix | index
             ipl_transform = IplTransform(
                 model_id=model_id,
                 model_name=model.model_name,
@@ -510,9 +511,11 @@ class GameDat:
                 position=position,
                 rotation=rotation,
                 source_file=source_file,
+                entity_id=entity_id,
             )
             summary.transforms_by_model.setdefault(model.model_name.lower(), []).append(ipl_transform)
             summary.transforms_by_id.setdefault(model_id, []).append(ipl_transform)
+            summary.transforms_by_entity_id[entity_id] = ipl_transform
         summary.inst_count_by_file[source_file] = inst_count
         summary.nonzero_interior_by_file[source_file] = 0
 
