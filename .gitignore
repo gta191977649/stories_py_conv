@@ -2,3 +2,4 @@
 /src/vcs_map_extract/__pycache__
 /tests
 .DS_Store
+.swp

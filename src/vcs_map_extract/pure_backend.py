@@ -141,6 +141,8 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
 
 def _make_txd_native(texture: DecodedTexture):
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
+    rgba = bytes(texture.rgba)
+    has_alpha = any(alpha != 255 for alpha in rgba[3::4])
     native = dragon_txd.TextureNative()
     native.platform_id = _dragon_dff.NativePlatformType.D3D9
     native.filter_mode = 0x06
@@ -155,13 +157,13 @@ def _make_txd_native(texture: DecodedTexture):
     native.num_levels = 1
     native.raster_type = 4
     native.platform_properties = SimpleNamespace(
-        alpha=True,
+        alpha=has_alpha,
         cube_texture=False,
         auto_mipmaps=False,
         compressed=False,
     )
     native.palette = b""
-    native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra8888(texture.rgba)]
+    native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra8888(rgba)]
     return native
 
 
@@ -170,6 +172,7 @@ def write_txd_from_decoded_textures(output_path: Path, textures: list[DecodedTex
     txd_file = dragon_txd.txd()
     txd_file.device_id = dragon_txd.DeviceType.DEVICE_D3D9
     txd_file.native_textures = [_make_txd_native(texture) for texture in textures]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(txd_file.write_memory(RW_VERSION))
     return [texture.name for texture in textures]
 
