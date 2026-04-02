@@ -725,8 +725,15 @@ def _quaternion_matrix(rotation: tuple[float, float, float, float]) -> np.ndarra
     return matrix
 
 
+def _conjugate_quaternion(rotation: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x, y, z, w = rotation
+    return (-x, -y, -z, w)
+
+
 def _ipl_matrix(transform: IplTransform) -> np.ndarray:
-    matrix = _quaternion_matrix(transform.rotation)
+    # GTA IPL rows store the conjugated quaternion. Convert back to the
+    # world-space rotation matrix before using the transform as an anchor.
+    matrix = _quaternion_matrix(_conjugate_quaternion(transform.rotation))
     matrix[0, 3] = transform.position[0]
     matrix[1, 3] = transform.position[1]
     matrix[2, 3] = transform.position[2]

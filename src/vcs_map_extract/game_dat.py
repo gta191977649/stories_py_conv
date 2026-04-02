@@ -33,6 +33,7 @@ MITYPE_PED = 7
 
 COMMENTED_MODELS = {"IslandLODbeach", "IslandLODmainland"}
 STREAM_NEAR_DUPLICATE_TOLERANCE = 6.0
+STREAMED_INTERIOR_IPL_ID = 1
 
 
 @dataclass(slots=True)
@@ -572,7 +573,7 @@ class GameDat:
                 key = (archive_name, instance.world_id)
                 candidate = (
                     model,
-                    0,
+                    STREAMED_INTERIOR_IPL_ID,
                     position,
                     rotation,
                     pass_index,
@@ -813,7 +814,9 @@ def _matrix_to_ipl_quaternion(matrix: tuple[float, ...]) -> tuple[float, float, 
         z = sq * 0.5
         w = rp * (m01 - m10)
 
-    values = (x, y, z, w)
+    # GTA stores conjugated quaternions in IPL rows and conjugates them again
+    # when rebuilding the instance matrix.
+    values = (-x, -y, -z, w)
     return tuple(0.0 if abs(value) < 1e-8 else value for value in values)
 
 
