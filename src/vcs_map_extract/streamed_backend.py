@@ -354,6 +354,24 @@ class LVZArchive:
         elif exact_block_size > 0 and 16 + exact_block_size <= len(blob):
             block_size = exact_block_size
 
+        # Some streamed overlay 4bpp blobs advertise an unswizzled header even
+        # though their index data is stored in swizzled PS2 order. Billboards
+        # like beach_1940 show visible scanline artifacts unless we force the
+        # swizzle bit back on for this blob class.
+        if (
+            origin == "overlay"
+            and parsed.bpp == 4
+            and parsed.swizzle_mask == 0
+            and parsed.width >= 128
+            and parsed.height >= 128
+        ):
+            header = Ps2TexHeader(
+                reserved0=header.reserved0,
+                reserved1=header.reserved1,
+                raster_offset=header.raster_offset,
+                flags=header.flags | 0x1,
+            )
+
         rgba = decode_ps2_texture(blob, header, block_size, four_bit_high_nibble_first=True)
         if rgba is None:
             return None, "synthetic"
