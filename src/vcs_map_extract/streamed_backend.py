@@ -264,7 +264,6 @@ class LVZArchive:
     def _load_area_resources(self) -> dict[int, bytes]:
         resources: dict[int, bytes] = {}
         for area_index, area in enumerate(self.level.areas):
-            _log(f"[streamed] {self.archive_name} area {area_index + 1}/{len(self.level.areas)}")
             for res_id, blob in parse_area_resource_table(self.level, area).items():
                 resources[res_id] = blob
         return resources
