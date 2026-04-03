@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -541,17 +541,21 @@ def write_col_from_mesh(mesh: MeshData, output_path: Path, model_id: int = 0) ->
     return 1
 
 
-def run_conversion_jobs(jobs: list[dict[str, str]]) -> list[dict[str, object]]:
+def run_conversion_jobs(
+    jobs: list[dict[str, str]],
+    *,
+    log: Callable[[str], None] | None = print,
+    log_success: bool = True,
+    on_job_done: Callable[[dict[str, str], dict[str, object]], None] | None = None,
+) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for job in jobs:
         input_path = Path(job["input"])
         output_path = Path(job["output"])
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            print(
-                f"[convert] {job['archive']} {job['type']} {input_path.name} -> {output_path.name}",
-                flush=True,
-            )
+            if log is not None and log_success:
+                log(f"[convert] {job['archive']} {job['type']} {input_path.name} -> {output_path.name}")
             result: dict[str, object] = {
                 "job": job["type"],
                 "archive": job.get("archive"),
@@ -568,10 +572,8 @@ def run_conversion_jobs(jobs: list[dict[str, str]]) -> list[dict[str, object]]:
             else:
                 raise ValueError(f"Unsupported job type: {job['type']}")
         except Exception as exc:  # pragma: no cover - exercised by live data failures
-            print(
-                f"[convert] FAILED {job['archive']} {job['type']} {input_path.name}: {exc}",
-                flush=True,
-            )
+            if log is not None:
+                log(f"[convert] FAILED {job['archive']} {job['type']} {input_path.name}: {exc}")
             result = {
                 "job": job["type"],
                 "archive": job.get("archive"),
@@ -581,4 +583,6 @@ def run_conversion_jobs(jobs: list[dict[str, str]]) -> list[dict[str, object]]:
                 "error": str(exc),
             }
         results.append(result)
+        if on_job_done is not None:
+            on_job_done(job, result)
     return results

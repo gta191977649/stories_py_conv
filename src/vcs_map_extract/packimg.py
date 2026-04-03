@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from .constants import ARCHIVE_ORDER
 from .img_io import write_ver2_img
 
 
+_LOG_SINK: Callable[[str], None] | None = None
+
+
+def set_log_sink(sink: Callable[[str], None] | None) -> Callable[[str], None] | None:
+    global _LOG_SINK
+    previous = _LOG_SINK
+    _LOG_SINK = sink
+    return previous
+
+
 def _log(message: str) -> None:
+    if _LOG_SINK is not None:
+        _LOG_SINK(message)
+        return
     print(message, flush=True)
 
 
