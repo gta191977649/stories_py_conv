@@ -83,6 +83,17 @@ def _ps2_palette_bytes(bpp: int) -> int:
     return 0
 
 
+def _ps2_flags_with_layout(flags: int, *, swizzle_mask: int | None = None, width: int | None = None, height: int | None = None) -> int:
+    updated = flags
+    if swizzle_mask is not None:
+        updated = (updated & ~0xFF) | (swizzle_mask & 0xFF)
+    if width is not None:
+        updated = (updated & ~(0x3F << 20)) | (((int(width).bit_length() - 1) & 0x3F) << 20)
+    if height is not None:
+        updated = (updated & ~(0x3F << 26)) | (((int(height).bit_length() - 1) & 0x3F) << 26)
+    return updated
+
+
 @dataclass(slots=True)
 class MDLMaterial:
     texture_id: int
@@ -354,25 +365,62 @@ class LVZArchive:
         elif exact_block_size > 0 and 16 + exact_block_size <= len(blob):
             block_size = exact_block_size
 
-        # Some streamed overlay 4bpp blobs advertise an unswizzled header even
-        # though their index data is stored in swizzled PS2 order. Billboards
-        # like beach_1940 show visible scanline artifacts unless we force the
-        # swizzle bit back on for this blob class.
-        if (
-            origin == "overlay"
-            and parsed.bpp == 4
-            and parsed.swizzle_mask == 0
-            and parsed.width >= 128
-            and parsed.height >= 128
-        ):
-            header = Ps2TexHeader(
-                reserved0=header.reserved0,
-                reserved1=header.reserved1,
-                raster_offset=header.raster_offset,
-                flags=header.flags | 0x1,
-            )
+        rgba: np.ndarray | None = None
+        best_quality: tuple[int, int, int, int, int] | None = None
+        flag_variants = [header.flags]
+        dimension_variants = [(parsed.width, parsed.height)]
+        nibble_orders = (True,) if parsed.bpp == 4 else (False,)
+        if parsed.bpp == 4 and parsed.width >= 64 and parsed.height >= 64:
+            # Streamed 4-bit PS2 textures are inconsistent: some blobs lie
+            # about the swizzle bit, flip the pixel nibble order, or store
+            # non-square billboard rasters with their width/height exponents
+            # transposed. Try the plausible layouts and keep the decode with
+            # the fewest visible stripe/checkerboard artifacts.
+            toggled_swizzle = header.flags ^ 0x1
+            if toggled_swizzle != header.flags:
+                flag_variants.append(toggled_swizzle)
+            if parsed.width != parsed.height:
+                dimension_variants.append((parsed.height, parsed.width))
+            nibble_orders = (True, False)
 
-        rgba = decode_ps2_texture(blob, header, block_size, four_bit_high_nibble_first=True)
+        seen_layouts: set[tuple[int, int, int]] = set()
+        for width, height in dimension_variants:
+            for flags in flag_variants:
+                swizzle_mask = flags & 0xFF
+                layout_key = (width, height, swizzle_mask)
+                if layout_key in seen_layouts:
+                    continue
+                seen_layouts.add(layout_key)
+                candidate_flags = _ps2_flags_with_layout(
+                    header.flags,
+                    swizzle_mask=swizzle_mask,
+                    width=width,
+                    height=height,
+                )
+                candidate_header = (
+                    header
+                    if candidate_flags == header.flags
+                    else Ps2TexHeader(
+                        reserved0=header.reserved0,
+                        reserved1=header.reserved1,
+                        raster_offset=header.raster_offset,
+                        flags=candidate_flags,
+                    )
+                )
+                for four_bit_high_nibble_first in nibble_orders:
+                    candidate_rgba = decode_ps2_texture(
+                        blob,
+                        candidate_header,
+                        block_size,
+                        four_bit_high_nibble_first=four_bit_high_nibble_first,
+                    )
+                    if candidate_rgba is None:
+                        continue
+                    candidate_quality = _texture_quality_from_rgba(candidate_rgba)
+                    if best_quality is None or candidate_quality > best_quality:
+                        rgba = candidate_rgba
+                        best_quality = candidate_quality
+
         if rgba is None:
             return None, "synthetic"
         texture_name, naming_mode = self._recover_texture_name(blob, res_id)
@@ -897,15 +945,56 @@ def merge_texture(existing: DecodedTexture, incoming: DecodedTexture) -> Decoded
     return existing
 
 
-def _texture_quality(texture: DecodedTexture) -> tuple[int, int, int]:
-    rgba = np.frombuffer(texture.rgba, dtype=np.uint8)
-    alpha = rgba[3::4]
-    rgb = rgba.reshape((-1, 4))[:, :3]
-    return (
-        texture.width * texture.height,
-        int(np.count_nonzero(alpha)),
-        int(rgb.sum()),
+def _axis_abs_diff(values: np.ndarray, axis: int, step: int) -> int:
+    if values.shape[axis] <= step:
+        return 0
+    if axis == 0:
+        lhs = values[step:, ...]
+        rhs = values[:-step, ...]
+    else:
+        lhs = values[:, step:, ...]
+        rhs = values[:, :-step, ...]
+    return int(np.abs(lhs - rhs).sum())
+
+
+def _texture_artifact_metrics_from_rgba(rgba: np.ndarray) -> tuple[int, int]:
+    pixels = np.asarray(rgba, dtype=np.uint8)
+    rgb = pixels[:, :, :3].astype(np.int32, copy=False)
+    luma = ((rgb[:, :, 0] * 77) + (rgb[:, :, 1] * 150) + (rgb[:, :, 2] * 29)) >> 8
+    alpha = pixels[:, :, 3].astype(np.int32, copy=False)
+    adjacent = (
+        _axis_abs_diff(luma, 0, 1)
+        + _axis_abs_diff(luma, 1, 1)
+        + _axis_abs_diff(alpha, 0, 1)
+        + _axis_abs_diff(alpha, 1, 1)
     )
+    skip2 = (
+        _axis_abs_diff(luma, 0, 2)
+        + _axis_abs_diff(luma, 1, 2)
+        + _axis_abs_diff(alpha, 0, 2)
+        + _axis_abs_diff(alpha, 1, 2)
+    )
+    return max(0, adjacent - skip2), adjacent
+
+
+def _texture_quality_from_rgba(rgba: np.ndarray) -> tuple[int, int, int, int, int]:
+    pixels = np.asarray(rgba, dtype=np.uint8)
+    height, width, _channels = pixels.shape
+    periodic, adjacent = _texture_artifact_metrics_from_rgba(pixels)
+    alpha = pixels[:, :, 3]
+    rgb_sum = int(pixels[:, :, :3].astype(np.uint64, copy=False).sum())
+    return (
+        width * height,
+        -adjacent,
+        -periodic,
+        int(np.count_nonzero(alpha)),
+        rgb_sum,
+    )
+
+
+def _texture_quality(texture: DecodedTexture) -> tuple[int, int, int, int, int]:
+    rgba = np.frombuffer(texture.rgba, dtype=np.uint8).reshape((texture.height, texture.width, 4))
+    return _texture_quality_from_rgba(rgba)
 
 
 def _geometry_signature(fragment_keys: set[tuple[int, int, int]]) -> str:

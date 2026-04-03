@@ -99,6 +99,19 @@ class ImageEncoder:
             ret.extend([b, g, r])
         return bytes(ret)
 
+    @staticmethod
+    def rgba_to_bgra565(rgba_data):
+        ret = bytearray()
+        for i in range(0, len(rgba_data), 4):
+            r, g, b = rgba_data[i:i+3]
+            color = (
+                (((r * 31) + 127) // 255) << 11
+                | (((g * 63) + 127) // 255) << 5
+                | (((b * 31) + 127) // 255)
+            )
+            ret.extend(pack("<H", color))
+        return bytes(ret)
+
 #######################################################
 class ImageDecoder:
 

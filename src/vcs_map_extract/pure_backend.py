@@ -169,11 +169,8 @@ def _make_txd_native(texture: DecodedTexture):
     native.uv_addressing = 0b00010001
     native.name = texture.name
     native.mask = ""
-    native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
-    native.d3d_format = dragon_txd.D3DFormat.D3D_8888
     native.width = texture.width
     native.height = texture.height
-    native.depth = 32
     native.num_levels = 1
     native.raster_type = 4
     native.platform_properties = SimpleNamespace(
@@ -183,7 +180,16 @@ def _make_txd_native(texture: DecodedTexture):
         compressed=False,
     )
     native.palette = b""
-    native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra8888(rgba)]
+    if has_alpha:
+        native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
+        native.d3d_format = dragon_txd.D3DFormat.D3D_8888
+        native.depth = 32
+        native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra8888(rgba)]
+    else:
+        native.raster_format_flags = dragon_txd.RasterFormat.RASTER_565 << 8
+        native.d3d_format = dragon_txd.D3DFormat.D3D_565
+        native.depth = 16
+        native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra565(rgba)]
     return native
 
 
