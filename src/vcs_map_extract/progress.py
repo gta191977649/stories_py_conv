@@ -3,7 +3,36 @@ from __future__ import annotations
 import sys
 from typing import Callable
 
-from tqdm.auto import tqdm
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:  # pragma: no cover - exercised only when tqdm is absent
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(
+            self,
+            total: int = 0,
+            desc: str = "",
+            unit: str = "item",
+            dynamic_ncols: bool = True,
+            position: int = 0,
+            leave: bool = True,
+            disable: bool = False,
+        ) -> None:
+            self.total = total
+            self.n = 0
+            self.disable = disable
+
+        def update(self, step: int = 1) -> None:
+            self.n += step
+
+        def set_postfix_str(self, _value: str) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+        @staticmethod
+        def write(message: str) -> None:
+            print(message, flush=True)
 
 
 class ProgressDisplay:
@@ -68,4 +97,3 @@ class ProgressDisplay:
         if self.current is not None:
             self.current.close()
             self.current = None
-
