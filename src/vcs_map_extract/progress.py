@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from typing import Callable
 
@@ -41,7 +42,7 @@ class ProgressDisplay:
         self.disable = not sys.stderr.isatty()
         self.overall = tqdm(
             total=max(0, total_phases),
-            desc=title,
+            desc=self._clip_text(title, self._max_desc_width()),
             unit="phase",
             dynamic_ncols=True,
             position=0,
@@ -53,10 +54,10 @@ class ProgressDisplay:
     def start_phase(self, label: str, total: int, *, unit: str = "item") -> None:
         self._close_current()
         if not self.disable:
-            self.overall.set_postfix_str(label)
+            self.overall.set_postfix_str(self._clip_text(label, self._max_overall_postfix_width()))
         self.current = tqdm(
             total=max(0, total),
-            desc=label,
+            desc=self._clip_text(label, self._max_desc_width()),
             unit=unit,
             dynamic_ncols=True,
             position=1,
@@ -69,7 +70,7 @@ class ProgressDisplay:
     def advance(self, step: int = 1, *, detail: str | None = None) -> None:
         if self.current is not None:
             if detail and not self.disable:
-                self.current.set_postfix_str(detail)
+                self.current.set_postfix_str(self._clip_text(detail, self._max_current_postfix_width()))
             self.current.update(step)
 
     def finish_phase(self, *, summary: str | None = None) -> None:
@@ -97,3 +98,29 @@ class ProgressDisplay:
         if self.current is not None:
             self.current.close()
             self.current = None
+
+    def _terminal_columns(self) -> int:
+        return max(40, shutil.get_terminal_size(fallback=(100, 20)).columns)
+
+    def _max_desc_width(self) -> int:
+        columns = self._terminal_columns()
+        return max(18, min(32, columns // 3))
+
+    def _max_overall_postfix_width(self) -> int:
+        columns = self._terminal_columns()
+        return max(12, columns - self._max_desc_width() - 40)
+
+    def _max_current_postfix_width(self) -> int:
+        columns = self._terminal_columns()
+        return max(10, columns - self._max_desc_width() - 52)
+
+    @staticmethod
+    def _clip_text(value: str, limit: int) -> str:
+        text = " ".join(value.split())
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3] + "..."

@@ -946,10 +946,6 @@ def export_streamed_archive(
             continue
         try:
             diagnostics = report.interior_diagnostics if model.export_kind.startswith("interior") else report.streamed_diagnostics
-            _log(
-                f"[streamed] {archive_name} model {model.output_name}: "
-                f"{len(model.placements)} resource candidates"
-            )
             visible_placements = [placement for placement in model.placements if placement.visible]
             hidden_placements = [placement for placement in model.placements if not placement.visible]
             placement_sets = [visible_placements or model.placements]
@@ -1029,9 +1025,9 @@ def export_streamed_archive(
                         continue
                     base_index = len(vertices)
                     vertices.extend(transformed_vertices)
-                    # PS2 UVs are emitted in the same convention as the standard
-                    # MDL path, so flip V here before writing the DFF.
-                    uvs.extend((u, 1.0 - v) for u, v in geometry.uvs)
+                    # Streamed PS2 geometry already uses the same UV convention
+                    # as the reference DFFs, so preserve V as-is.
+                    uvs.extend(geometry.uvs)
                     if geometry.vertex_colors and len(geometry.vertex_colors) == len(geometry.vertices):
                         vertex_colors.extend(geometry.vertex_colors)
                     else:
@@ -1159,7 +1155,6 @@ def export_streamed_archive(
                     models_recovered_via_swap += 1
                 if used_resource_origins == {"area"}:
                     models_recovered_only_area += 1
-                _log(f"[streamed] wrote {archive_name}/{output_stem}.dff + .col")
             else:
                 diagnostics.append(
                     f"{archive_name}: no geometry decoded for {model.output_name} from {len(model.placements)} candidate resource ids"
@@ -1173,11 +1168,9 @@ def export_streamed_archive(
             if txd_name.lower() == "knackers":
                 continue
             write_txd_from_decoded_textures(archive_dir / f"{sanitize_filename(txd_name)}.txd", list(textures.values()))
-            _log(f"[streamed] wrote {archive_name}/{sanitize_filename(txd_name)}.txd")
 
     if global_knackers_textures is None and knackers_textures:
         write_txd_from_decoded_textures(output_root / "knackers.txd", list(knackers_textures.values()))
-        _log("[streamed] updated knackers.txd")
 
     return {
         "exported_models": exported_models,
