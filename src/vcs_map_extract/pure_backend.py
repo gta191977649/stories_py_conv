@@ -356,7 +356,8 @@ def write_dff(input_path: Path, output_path: Path) -> None:
                 u, v = part_uvs[vertex_index]
             else:
                 u, v = 0.0, 0.0
-            uvs.append(dragon_dff.TexCoords(float(u), 1.0 - float(v)))
+            # PS2 MDL UVs already match the reference DFF convention.
+            uvs.append(dragon_dff.TexCoords(float(u), float(v)))
 
         part_colors = list(getattr(part, "vertex_colors", []))
         for vertex_index in range(len(part_vertices)):
