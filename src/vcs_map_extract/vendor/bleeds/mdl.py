@@ -495,7 +495,39 @@ def get_render_flag_names(render_flags: int) -> List[str]:
 # === Frame / Armature reading (no Blender objects) ===
 
 
-def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArmatureInfo:
+def _frame_name_ptr_offset(ctx: StoriesMDLContext, ptr: int) -> int:
+    if ctx.platform == "PS2":
+        name_ptr_offset = ptr + 0xA4
+    else:
+        name_ptr_offset = ptr + 0xA8
+    if ctx.import_type == 2:
+        name_ptr_offset += 4
+    return name_ptr_offset
+
+
+def _read_frame_name(ctx: StoriesMDLContext, f, ptr: int) -> str:
+    if ptr <= 0 or ptr >= ctx.file_len:
+        return ""
+
+    cur = f.tell()
+    try:
+        f.seek(_frame_name_ptr_offset(ctx, ptr))
+        bone_name_ptr = read_u32(f)
+        if bone_name_ptr <= 0 or bone_name_ptr >= ctx.file_len:
+            return ""
+        f.seek(bone_name_ptr)
+        name_bytes = bytearray()
+        while True:
+            b = f.read(1)
+            if b == b"\x00" or not b:
+                break
+            name_bytes.append(b[0])
+        return name_bytes.decode("utf-8", errors="ignore")
+    finally:
+        f.seek(cur)
+
+
+def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int, emit_logs: bool = True) -> StoriesArmatureInfo:
     arm = StoriesArmatureInfo()
     if frame_ptr == 0:
         return arm
@@ -503,31 +535,10 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
     arm.root_frame_ptr = frame_ptr
 
     def _walk(ptr: int, parent_world: Matrix, parent_ptr: int) -> None:
-        if ptr == 0:
+        if ptr == 0 or ptr in arm.frame_mats_local or ptr >= ctx.file_len:
             return
 
-        if ctx.platform == "PS2":
-            name_ptr_offset = ptr + 0xA4
-        else:
-            name_ptr_offset = ptr + 0xA8
-        if ctx.import_type == 2:
-            name_ptr_offset += 4
-
-        f.seek(name_ptr_offset)
-        bone_name_ptr = read_u32(f)
-        if bone_name_ptr != 0:
-            cur = f.tell()
-            f.seek(bone_name_ptr)
-            name_bytes = bytearray()
-            while True:
-                b = f.read(1)
-                if b == b"\x00" or not b:
-                    break
-                name_bytes.append(b[0])
-            bone_name = name_bytes.decode("utf-8", errors="ignore")
-            f.seek(cur)
-        else:
-            bone_name = "Bone"
+        bone_name = _read_frame_name(ctx, f, ptr) or "Bone"
 
         f.seek(ptr + 0x10)
         local_mat, _, _ = read_local_matrix(f)
@@ -540,9 +551,10 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
         arm.frame_order.append(ptr)
 
         global_mat = read_global_matrix(f, ptr + 0x50)
-        ctx.log(
-            f"Frame 0x{ptr:X}: name='{bone_name}', local={local_mat}, world={world_mat}, global={global_mat}"
-        )
+        if emit_logs:
+            ctx.log(
+                f"Frame 0x{ptr:X}: name='{bone_name}', local={local_mat}, world={world_mat}, global={global_mat}"
+            )
 
         f.seek(ptr + 0x90)
         child_ptr = read_u32(f)
@@ -556,6 +568,38 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
 
     _walk(frame_ptr, Matrix.Identity(4), 0)
     return arm
+
+
+def find_best_ped_frame_tree(ctx: StoriesMDLContext, f, preferred_ptr: int) -> StoriesArmatureInfo:
+    best_arm = process_frame_tree(ctx, f, preferred_ptr, emit_logs=False)
+    hierarchy_bones = list(getattr(ctx.atomic, "hierarchy_bones", []))
+    if len(best_arm.frame_order) >= max(2, len(hierarchy_bones) // 2):
+        return best_arm
+
+    frame_magic_values = {0x0180AA00, 0x0380AA00}
+    best_score = len(best_arm.frame_order)
+    current = f.tell()
+    try:
+        scan_limit = max(0, min(ctx.file_len - 0xAC, getattr(ctx.atomic, "geom_ptr", ctx.file_len)))
+        for ptr in range(0, scan_limit, 4):
+            f.seek(ptr)
+            if read_u32(f) not in frame_magic_values:
+                continue
+            root_name = _read_frame_name(ctx, f, ptr).lower()
+            if not root_name or root_name.endswith("geo"):
+                continue
+            candidate_arm = process_frame_tree(ctx, f, ptr, emit_logs=False)
+            if not candidate_arm.frame_order:
+                continue
+            score = len(candidate_arm.frame_order)
+            if root_name in {"root", "scene_root", "pelvis"}:
+                score += 100
+            if score > best_score:
+                best_arm = candidate_arm
+                best_score = score
+    finally:
+        f.seek(current)
+    return best_arm
 
 
 def process_hierarchy_block(ctx: StoriesMDLContext, f, hierarchy_ptr: int) -> tuple[List[StoriesHierarchyBone], List[Matrix]]:
@@ -938,12 +982,6 @@ def read_ps2_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesGeomet
 
                 batch_indices.append(base_vertex_index + len(batch_indices))
 
-            if not first_batch and batch_indices and strip_indices:
-                first_index = batch_indices[0]
-                strip_indices.append(strip_indices[-1])
-                strip_indices.append(first_index)
-                if len(strip_indices) % 2:
-                    strip_indices.append(first_index)
             strip_indices.extend(batch_indices)
 
             part.strips_meta.append(
@@ -1586,7 +1624,7 @@ class read_stories:
 
                 if mdl_type == "PED":
                     try:
-                        arm = process_frame_tree(ctx, f, frame_ptr)
+                        arm = find_best_ped_frame_tree(ctx, f, frame_ptr)
                         atomic_info.armature = arm
                     except Exception as e:
                         ctx.log(f"⚠️ Failed to build armature: {e}")

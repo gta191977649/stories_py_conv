@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from .pure_backend import DecodedTexture
 
 
-TEXTURE_EXTENSIONS = (".xtx", ".tex", ".chk")
+TEXTURE_EXTENSIONS = (".xtx", ".chk")
 
 
 def _log(message: str) -> None:
@@ -80,8 +80,8 @@ def _queue_standard_jobs(
         queued_models: set[str] = set()
         queued_txds: set[str] = set()
         queued_cols: set[str] = set()
+        queued_raw: set[str] = set()
         queued_output_models: set[str] = set()
-        queued_output_cols: set[str] = set()
         texture_priority = {ext: index for index, ext in enumerate(TEXTURE_EXTENSIONS)}
         chosen_texture_entries: dict[str, ImgDirectoryEntry] = {}
         texture_output_names: dict[str, str] = {}
@@ -106,21 +106,13 @@ def _queue_standard_jobs(
                 jobs.append({"type": "mdl", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
                 continue
 
-            if suffix == ".col2":
-                output_stem = col_output_by_entry.get(entry_key, sanitize_filename(base_name))
-                output_key = output_stem.lower()
-                if output_key in queued_output_cols:
-                    continue
-                queued_output_cols.add(output_key)
-                queued_cols.add(entry_key)
+            if suffix not in TEXTURE_EXTENSIONS:
+                queued_raw.add(entry_key)
                 raw_path = temp_root / archive_name / entry.name
                 safe_mkdir(raw_path.parent)
                 raw_path.write_bytes(reader.read_entry(entry))
-                output_path = archive_dir / f"{output_stem}.col"
-                jobs.append({"type": "col2", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
-                continue
-
-            if suffix not in TEXTURE_EXTENSIONS:
+                output_path = archive_dir / entry.name
+                jobs.append({"type": "raw", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
                 continue
 
             output_stem = sanitize_filename(base_name)
@@ -145,10 +137,11 @@ def _queue_standard_jobs(
         summary[archive_name]["queued_models"] = len(queued_models)
         summary[archive_name]["queued_txds"] = len(queued_txds)
         summary[archive_name]["queued_cols"] = len(queued_cols)
+        summary[archive_name]["queued_raw"] = len(queued_raw)
         if on_archive_done is None:
             _log(
                 f"[standard] queued {archive_name}: "
-                f"{len(queued_models)} dff, {len(queued_txds)} txd, {len(queued_cols)} col"
+                f"{len(queued_models)} dff, {len(queued_txds)} txd, {len(queued_cols)} col, {len(queued_raw)} raw"
             )
         if on_archive_done is not None:
             on_archive_done(archive_name, len(queued_models), len(queued_txds), len(queued_cols))

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import shutil
+import struct
 from types import SimpleNamespace
 from typing import Callable, Iterable
 
@@ -13,6 +15,7 @@ from .utils import sanitize_filename
 
 
 RW_VERSION = 0x36003
+_RW_MATRIX_TYPE_ORTHONORMAL = struct.unpack("<f", struct.pack("<I", 3))[0]
 
 
 @lru_cache(maxsize=1)
@@ -305,10 +308,19 @@ def _make_materials(geo):
     return materials
 
 
+def _matrix_to_rw_matrix(matrix: object) -> tuple[tuple[float, float, float, float], ...]:
+    array = np.asarray(tuple(tuple(float(value) for value in row) for row in matrix), dtype=np.float64)
+    return (
+        (float(array[0][0]), float(array[1][0]), float(array[2][0]), 0.0),
+        (float(array[0][1]), float(array[1][1]), float(array[2][1]), 0.0),
+        (float(array[0][2]), float(array[1][2]), float(array[2][2]), 0.0),
+        (float(array[0][3]), float(array[1][3]), float(array[2][3]), _RW_MATRIX_TYPE_ORTHONORMAL),
+    )
+
+
 def _invert_matrix4(matrix: object) -> tuple[tuple[float, float, float, float], ...]:
     array = np.asarray(tuple(tuple(float(value) for value in row) for row in matrix), dtype=np.float64)
-    inverted = np.linalg.inv(array)
-    return tuple(tuple(float(value) for value in row) for row in inverted.tolist())
+    return _matrix_to_rw_matrix(np.linalg.inv(array))
 
 
 def _matrix_to_frame_components(matrix: object):
@@ -346,6 +358,139 @@ def _collect_part_skin(part) -> tuple[list[list[int]], list[list[float]]]:
     return skin_indices, skin_weights
 
 
+def _build_ps2_skinned_mesh(ctx) -> tuple[
+    list[tuple[float, float, float]],
+    list[tuple[int, int, int]],
+    list[tuple[float, float]],
+    list[str],
+    list[tuple[int, int, int, int]],
+    list[list[int]],
+    list[list[float]],
+    list[tuple[float, float, float]] | None,
+]:
+    ps2_geo = ctx.atomic.ps2_geometry
+    vertices: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    uvs: list[tuple[float, float]] = []
+    face_materials: list[str] = []
+    vertex_colors: list[tuple[int, int, int, int]] = []
+    vertex_bone_indices: list[list[int]] = []
+    vertex_bone_weights: list[list[float]] = []
+    vertex_normals: list[tuple[float, float, float]] = []
+    vertex_index_by_key: dict[tuple[object, ...], int] = {}
+    strip_indices_by_material: dict[int, list[int]] = {}
+
+    for part in ps2_geo.parts:
+        material_index = int(getattr(part, "material_id", 0))
+        material_strip_indices = strip_indices_by_material.setdefault(material_index, [])
+        part_uvs = list(getattr(part, "uvs", []))
+        part_colors = list(getattr(part, "vertex_colors", []))
+        part_normals = list(getattr(part, "normals", []))
+        part_skin_indices, part_skin_weights = _collect_part_skin(part)
+
+        first_inst = len(material_strip_indices) == 0
+        first_batch = True
+        for strip in getattr(part, "strips_meta", []):
+            batch_indices: list[int] = []
+            for vertex_offset in range(int(strip.vertex_count)):
+                source_index = int(strip.base_vertex_index) + vertex_offset
+                if not (0 <= source_index < len(part.verts)):
+                    continue
+                vertex = tuple(map(float, part.verts[source_index]))
+                uv = tuple(map(float, part_uvs[source_index])) if source_index < len(part_uvs) else (0.0, 0.0)
+                color = (
+                    tuple(int(value) for value in part_colors[source_index])
+                    if source_index < len(part_colors)
+                    else (255, 255, 255, 255)
+                )
+                normal = (
+                    tuple(map(float, part_normals[source_index]))
+                    if source_index < len(part_normals)
+                    else (0.0, 0.0, 0.0)
+                )
+                bone_indices = (
+                    [int(value) for value in part_skin_indices[source_index][:4]]
+                    if source_index < len(part_skin_indices)
+                    else [0, 0, 0, 0]
+                )
+                bone_weights = (
+                    [float(value) for value in part_skin_weights[source_index][:4]]
+                    if source_index < len(part_skin_weights)
+                    else [1.0, 0.0, 0.0, 0.0]
+                )
+                while len(bone_indices) < 4:
+                    bone_indices.append(0)
+                while len(bone_weights) < 4:
+                    bone_weights.append(0.0)
+                total_weight = sum(bone_weights)
+                if total_weight > 1e-8:
+                    bone_weights = [weight / total_weight for weight in bone_weights]
+                else:
+                    bone_indices = [0, 0, 0, 0]
+                    bone_weights = [1.0, 0.0, 0.0, 0.0]
+
+                key = (
+                    tuple(round(value, 8) for value in vertex),
+                    tuple(round(value, 8) for value in uv),
+                    color,
+                    tuple(round(value, 8) for value in normal),
+                    tuple(bone_indices),
+                    tuple(round(value, 8) for value in bone_weights),
+                )
+                vertex_index = vertex_index_by_key.get(key)
+                if vertex_index is None:
+                    vertex_index = len(vertices)
+                    vertex_index_by_key[key] = vertex_index
+                    vertices.append(vertex)
+                    uvs.append(uv)
+                    vertex_colors.append(color)
+                    vertex_bone_indices.append(bone_indices)
+                    vertex_bone_weights.append(bone_weights)
+                    vertex_normals.append(normal)
+                batch_indices.append(vertex_index)
+
+            if batch_indices:
+                if not first_inst and first_batch:
+                    first_index = batch_indices[0]
+                    material_strip_indices.append(material_strip_indices[-1])
+                    material_strip_indices.append(first_index)
+                    if len(material_strip_indices) % 2:
+                        material_strip_indices.append(first_index)
+                material_strip_indices.extend(batch_indices)
+                first_inst = False
+                first_batch = False
+
+    for material_index, strip_indices in strip_indices_by_material.items():
+        material_name = (
+            getattr(ps2_geo.materials[material_index], "texture", "")
+            if material_index < len(ps2_geo.materials)
+            else ""
+        )
+        for face_index in range(2, len(strip_indices)):
+            if (face_index % 2) == 0:
+                a = strip_indices[face_index - 2]
+                b = strip_indices[face_index - 1]
+                c = strip_indices[face_index]
+            else:
+                a = strip_indices[face_index - 1]
+                b = strip_indices[face_index - 2]
+                c = strip_indices[face_index]
+            if a == b or b == c or c == a:
+                continue
+            va, vb, vc = vertices[a], vertices[b], vertices[c]
+            ux, uy, uz = vb[0] - va[0], vb[1] - va[1], vb[2] - va[2]
+            vx, vy, vz = vc[0] - va[0], vc[1] - va[1], vc[2] - va[2]
+            area = ((uy * vz - uz * vy) ** 2 + (uz * vx - ux * vz) ** 2 + (ux * vy - uy * vx) ** 2) ** 0.5 * 0.5
+            if area <= 1e-9:
+                continue
+            faces.append((a, b, c))
+            face_materials.append(material_name)
+
+    if vertex_normals and any(normal != (0.0, 0.0, 0.0) for normal in vertex_normals):
+        return vertices, faces, uvs, face_materials, vertex_colors, vertex_bone_indices, vertex_bone_weights, vertex_normals
+    return vertices, faces, uvs, face_materials, vertex_colors, vertex_bone_indices, vertex_bone_weights, None
+
+
 def _context_has_skin(ctx) -> bool:
     if getattr(ctx.atomic, "hierarchy_bones", None):
         return True
@@ -380,6 +525,151 @@ def _default_ped_bone_records(mdl_mod, armature) -> list[tuple[int, int, int, st
     return records
 
 
+def _ordered_armature_bone_ptrs(armature) -> list[int]:
+    ordered_ptrs: list[int] = []
+    for ptr in getattr(armature, "frame_order", []):
+        name = str(getattr(armature, "frame_names", {}).get(ptr, ""))
+        canonical = name.lower().replace(" ", "_")
+        if canonical.endswith("geo"):
+            continue
+        ordered_ptrs.append(ptr)
+    return ordered_ptrs
+
+
+def _hierarchy_ordered_armature_ptrs(armature) -> list[int]:
+    frame_order = list(getattr(armature, "frame_order", []))
+    if not frame_order:
+        return []
+
+    children_by_parent: dict[int, list[int]] = {}
+    for ptr in frame_order:
+        parent_ptr = int(getattr(armature, "frame_parent_ptrs", {}).get(ptr, 0))
+        children_by_parent.setdefault(parent_ptr, []).append(ptr)
+
+    first_child_by_ptr: dict[int, int] = {}
+    sibling_by_ptr: dict[int, int] = {}
+    for _parent_ptr, children in children_by_parent.items():
+        if not children:
+            continue
+        first_child_by_ptr[_parent_ptr] = children[0]
+        for left, right in zip(children, children[1:], strict=False):
+            sibling_by_ptr[left] = right
+
+    def _walk(ptr: int, out: list[int]) -> None:
+        sibling_ptr = sibling_by_ptr.get(ptr)
+        if sibling_ptr is not None:
+            _walk(sibling_ptr, out)
+        out.append(ptr)
+        child_ptr = first_child_by_ptr.get(ptr)
+        if child_ptr is not None:
+            _walk(child_ptr, out)
+
+    ordered_ptrs: list[int] = []
+    _walk(frame_order[0], ordered_ptrs)
+
+    filtered_ptrs: list[int] = []
+    for ptr in ordered_ptrs:
+        name = str(getattr(armature, "frame_names", {}).get(ptr, ""))
+        canonical = name.lower().replace(" ", "_")
+        if canonical.endswith("geo"):
+            continue
+        if canonical.startswith("male_base"):
+            continue
+        if canonical in {"pivots", "scene_root"}:
+            continue
+        filtered_ptrs.append(ptr)
+    return filtered_ptrs
+
+
+_CUTSCENE_FACE_FRAME_BY_BONE_ID: dict[int, str] = {
+    0: "root",
+    1: "pelvis",
+    2: "spine",
+    3: "spine1",
+    4: "neck",
+    5: "head",
+    8: "jawajnt",
+    9: "lowlidjnt",
+    21: "r_clavicle",
+    22: "r_upperarm",
+    23: "r_forearm",
+    24: "r_hand",
+    25: "r_finger0",
+    26: "r_finger01",
+    27: "r_cheekjnt",
+    28: "r_cornerajnt",
+    29: "r_cornerbjnt",
+    31: "l_clavicle",
+    32: "l_upperarm",
+    33: "l_forearm",
+    34: "l_hand",
+    35: "l_finger0",
+    36: "l_finger01",
+    37: "l_cheekjnt",
+    38: "l_cornerajnt",
+    39: "l_cornerbjnt",
+    41: "l_thigh",
+    42: "l_calf",
+    43: "l_foot",
+    44: "l_browajnt",
+    45: "l_browbjnt",
+    46: "l_eyejnt",
+    47: "l_jawajnt",
+    48: "l_jawbjnt",
+    49: "l_lidjnt",
+    50: "l_lipupajnt",
+    51: "r_thigh",
+    52: "r_calf",
+    53: "r_foot",
+    54: "r_browajnt",
+    55: "r_browbjnt",
+    56: "r_eyejnt",
+    57: "r_jawajnt",
+    58: "r_jawbjnt",
+    59: "r_lidjnt",
+    60: "r_lipupajnt",
+    2000: "_footsteps",
+    2001: "l_toe0",
+    2002: "r_toe0",
+}
+
+_CUTSCENE_FACE_PLACEHOLDER_IDS_BY_SLOT: dict[int, int] = {
+    1: 2000,
+    44: 2001,
+    48: 2002,
+}
+
+
+def _cutscene_face_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
+    armature = ctx.atomic.armature
+    name_to_ptr = {
+        mdl_mod.canon_frame_name(name): ptr
+        for ptr, name in armature.frame_names.items()
+    }
+    if "rootheadrig" not in name_to_ptr:
+        return []
+
+    hierarchy_bones = list(getattr(ctx.atomic, "hierarchy_bones", []))
+    if len(hierarchy_bones) != 49:
+        return []
+
+    records: list[tuple[int, int, int, str, int]] = []
+    for slot, bone in enumerate(hierarchy_bones):
+        bone_id = int(bone.id)
+        canonical_name = _CUTSCENE_FACE_FRAME_BY_BONE_ID.get(bone_id)
+        if canonical_name is None:
+            patched_id = _CUTSCENE_FACE_PLACEHOLDER_IDS_BY_SLOT.get(slot)
+            if patched_id is None:
+                return []
+            bone_id = patched_id
+            canonical_name = _CUTSCENE_FACE_FRAME_BY_BONE_ID[patched_id]
+        ptr = name_to_ptr.get(canonical_name)
+        if ptr is None:
+            return []
+        records.append((bone_id, int(bone.index), int(bone.type), canonical_name, ptr))
+    return records
+
+
 def _ped_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
     armature = ctx.atomic.armature
     name_to_ptr = {
@@ -387,6 +677,24 @@ def _ped_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
         for ptr, name in armature.frame_names.items()
     }
     hierarchy_bones = list(getattr(ctx.atomic, "hierarchy_bones", []))
+
+    cutscene_face_records = _cutscene_face_bone_records(ctx, mdl_mod)
+    if cutscene_face_records:
+        return cutscene_face_records
+
+    hierarchy_ptrs = _hierarchy_ordered_armature_ptrs(armature)
+    if hierarchy_bones and len(hierarchy_ptrs) == len(hierarchy_bones):
+        return [
+            (
+                int(bone.id),
+                int(bone.index),
+                int(bone.type),
+                str(armature.frame_names.get(ptr, "bone")),
+                ptr,
+            )
+            for bone, ptr in zip(hierarchy_bones, hierarchy_ptrs, strict=True)
+        ]
+
     records: list[tuple[int, int, int, str, int]] = []
     for bone in hierarchy_bones:
         if 0 <= bone.index < len(mdl_mod.commonBoneOrderVCS):
@@ -397,18 +705,45 @@ def _ped_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
         if ptr is None:
             continue
         records.append((int(bone.id), int(bone.index), int(bone.type), canonical_name, ptr))
-    return records or _default_ped_bone_records(mdl_mod, armature)
+
+    ordered_ptrs = _ordered_armature_bone_ptrs(armature)
+    if hierarchy_bones and len(ordered_ptrs) >= len(hierarchy_bones):
+        if len(records) >= len(hierarchy_bones):
+            return records
+        topology_records: list[tuple[int, int, int, str, int]] = []
+        for bone, ptr in zip(hierarchy_bones, ordered_ptrs, strict=False):
+            frame_name = str(armature.frame_names.get(ptr, "bone"))
+            if 0 <= bone.index < len(mdl_mod.commonBoneOrderVCS):
+                frame_name = mdl_mod.commonBoneOrderVCS[bone.index]
+            topology_records.append((int(bone.id), int(bone.index), int(bone.type), frame_name, ptr))
+        if len(topology_records) >= len(hierarchy_bones):
+            return topology_records
+
+    if records:
+        return records
+
+    return _default_ped_bone_records(mdl_mod, armature)
 
 
 def _skin_inverse_matrices(ctx, bone_records: list[tuple[int, int, int, str, int]]) -> list[tuple[tuple[float, float, float, float], ...]]:
-    matrices = list(getattr(ctx.atomic, "skin_inverse_matrices", []))
-    if len(matrices) == len(bone_records):
-        return [
-            tuple(tuple(float(value) for value in row) for row in matrix)
-            for matrix in matrices
-        ]
     armature = ctx.atomic.armature
-    return [_invert_matrix4(armature.frame_mats_world[ptr]) for _bone_id, _index, _type, _name, ptr in bone_records]
+    geometry_ptr = getattr(ctx.atomic, "frame_ptr", 0)
+    geometry_world = armature.frame_mats_world.get(geometry_ptr)
+    if geometry_world is None:
+        geometry_world = next(iter(getattr(armature, "frame_mats_world", {}).values()), np.identity(4))
+    geometry_world_array = np.asarray(
+        tuple(tuple(float(value) for value in row) for row in geometry_world),
+        dtype=np.float64,
+    )
+
+    inverse_matrices: list[tuple[tuple[float, float, float, float], ...]] = []
+    for _bone_id, _index, _type, _name, ptr in bone_records:
+        bone_world = np.asarray(
+            tuple(tuple(float(value) for value in row) for row in armature.frame_mats_world[ptr]),
+            dtype=np.float64,
+        )
+        inverse_matrices.append(_matrix_to_rw_matrix(np.linalg.inv(bone_world) @ geometry_world_array))
+    return inverse_matrices
 
 
 def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
@@ -421,7 +756,6 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
 
     armature = ctx.atomic.armature
     frame_ptrs = [ptr for _bone_id, _index, _type, _name, ptr in bone_records]
-    frame_index_by_ptr = {ptr: index for index, ptr in enumerate(frame_ptrs)}
 
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int]] = []
@@ -430,48 +764,20 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
     vertex_colors: list[tuple[int, int, int, int]] = []
     vertex_bone_indices: list[list[int]] = []
     vertex_bone_weights: list[list[float]] = []
+    source_normals: list[tuple[float, float, float]] | None = None
 
     ps2_geo = ctx.atomic.ps2_geometry
     if ps2_geo.parts:
-        for part in ps2_geo.parts:
-            base_index = len(vertices)
-            vertices.extend(tuple(map(float, vertex)) for vertex in part.verts)
-
-            part_uvs = list(getattr(part, "uvs", []))
-            for vertex_index in range(len(part.verts)):
-                if vertex_index < len(part_uvs):
-                    u, v = part_uvs[vertex_index]
-                else:
-                    u, v = 0.0, 0.0
-                uvs.append((float(u), float(v)))
-
-            part_colors = list(getattr(part, "vertex_colors", []))
-            for vertex_index in range(len(part.verts)):
-                if vertex_index < len(part_colors):
-                    r, g, b, a = part_colors[vertex_index]
-                    vertex_colors.append((int(r), int(g), int(b), int(a)))
-                else:
-                    vertex_colors.append((255, 255, 255, 255))
-
-            part_skin_indices, part_skin_weights = _collect_part_skin(part)
-            for indices, weights in zip(part_skin_indices, part_skin_weights, strict=True):
-                if sum(weights) <= 1e-8:
-                    vertex_bone_indices.append([0, 0, 0, 0])
-                    vertex_bone_weights.append([1.0, 0.0, 0.0, 0.0])
-                else:
-                    vertex_bone_indices.append([int(index) for index in indices[:4]])
-                    vertex_bone_weights.append([float(weight) for weight in weights[:4]])
-
-            material_index = int(getattr(part, "material_id", 0))
-            material_name = (
-                getattr(ps2_geo.materials[material_index], "texture", "")
-                if material_index < len(ps2_geo.materials)
-                else ""
-            )
-            for face in part.faces:
-                a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
-                faces.append((a, b, c))
-                face_materials.append(material_name)
+        (
+            vertices,
+            faces,
+            uvs,
+            face_materials,
+            vertex_colors,
+            vertex_bone_indices,
+            vertex_bone_weights,
+            source_normals,
+        ) = _build_ps2_skinned_mesh(ctx)
     else:
         psp_geo = ctx.atomic.psp_geometry
         for mesh in psp_geo.meshes:
@@ -525,7 +831,7 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
     if not vertices or not faces:
         raise ValueError(f"No skinned geometry data available for {output_path}")
 
-    normals = _calculate_normals(vertices, faces)
+    normals = source_normals if source_normals and len(source_normals) == len(vertices) else _calculate_normals(vertices, faces)
     (cx, cy, cz), radius = _calculate_bounds(vertices)
 
     material_names: list[str] = []
@@ -555,13 +861,13 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
     geometry.vertices = [dragon_dff.Vector(*vertex) for vertex in vertices]
     geometry.normals = [dragon_dff.Vector(*normal) for normal in normals]
     geometry.uv_layers = [[dragon_dff.TexCoords(float(u), float(v)) for u, v in uvs]]
-    geometry.prelit_colors = [dragon_dff.RGBA(*color) for color in vertex_colors]
     geometry.triangles = [
         dragon_dff.Triangle(b, a, material_slot.get(face_materials[index], 0), c)
         for index, (a, b, c) in enumerate(faces)
     ]
     geometry.materials = materials or _make_materials(SimpleNamespace(materials=[], parts=[SimpleNamespace(material_id=0)]))
     geometry.bounding_sphere = dragon_dff.Sphere(cx, cy, cz, radius)
+    geometry.export_flags["triangle_strip"] = True
 
     skin = dragon_dff.SkinPLG()
     skin.num_bones = len(bone_records)
@@ -570,22 +876,42 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
     skin.bone_matrices = _skin_inverse_matrices(ctx, bone_records)
     geometry.extensions["skin"] = skin
 
-    root_bone_id = int(bone_records[0][0])
-    root_frame_index = 0
+    full_frame_ptrs = list(getattr(armature, "frame_order", []))
+    if not full_frame_ptrs:
+        full_frame_ptrs = frame_ptrs
+    for ptr in frame_ptrs:
+        if ptr not in full_frame_ptrs:
+            full_frame_ptrs.append(ptr)
+    geometry_ptr = getattr(ctx.atomic, "frame_ptr", 0)
+    if geometry_ptr in full_frame_ptrs:
+        full_frame_ptrs.remove(geometry_ptr)
+        geometry_parent_ptr = armature.frame_parent_ptrs.get(geometry_ptr, 0)
+        insert_at = full_frame_ptrs.index(geometry_parent_ptr) + 1 if geometry_parent_ptr in full_frame_ptrs else 0
+        full_frame_ptrs.insert(insert_at, geometry_ptr)
+    frame_index_by_ptr = {ptr: index for index, ptr in enumerate(full_frame_ptrs)}
+    bone_record_by_ptr = {ptr: (bone_id, bone_index, bone_type, canonical_name) for bone_id, bone_index, bone_type, canonical_name, ptr in bone_records}
+    root_bone_ptr = bone_records[0][4]
 
     dff_file = dragon_dff.dff()
-    for bone_list_index, (bone_id, bone_index, bone_type, _canonical_name, ptr) in enumerate(bone_records):
+    for ptr in full_frame_ptrs:
         frame = dragon_dff.Frame()
         frame.rotation_matrix, frame.position = _matrix_to_frame_components(armature.frame_mats_local[ptr])
         parent_ptr = armature.frame_parent_ptrs.get(ptr, 0)
         frame.parent = frame_index_by_ptr[parent_ptr] if parent_ptr in frame_index_by_ptr else -1
-        if frame.parent < 0:
-            root_frame_index = bone_list_index
         frame.creation_flags = 0
         frame.name = armature.frame_names.get(ptr, frame_name)
-        frame.bone_data = dragon_dff.HAnimPLG()
-        frame.bone_data.header = dragon_dff.HAnimHeader(0x100, int(bone_id), len(bone_records) if bone_list_index == root_frame_index else 0)
-        if bone_list_index == root_frame_index:
+        if ptr in bone_record_by_ptr:
+            bone_id, bone_index, bone_type, _canonical_name = bone_record_by_ptr[ptr]
+            frame.bone_data = dragon_dff.HAnimPLG()
+            frame.bone_data.header = dragon_dff.HAnimHeader(
+                0x100,
+                int(bone_id),
+                len(bone_records) if ptr == root_bone_ptr else 0,
+            )
+        elif ptr in {armature.root_frame_ptr, geometry_ptr}:
+            frame.bone_data = dragon_dff.HAnimPLG()
+            frame.bone_data.header = dragon_dff.HAnimHeader(0x100, -1, 0)
+        if ptr == root_bone_ptr:
             frame.bone_data.bones = [
                 dragon_dff.Bone(int(entry_bone_id), int(entry_index), int(entry_type))
                 for entry_bone_id, entry_index, entry_type, _entry_name, _entry_ptr in bone_records
@@ -593,9 +919,12 @@ def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
         dff_file.frame_list.append(frame)
 
     atomic = dragon_dff.Atomic()
-    atomic.frame = root_frame_index
+    atomic.frame = frame_index_by_ptr.get(
+        geometry_ptr,
+        frame_index_by_ptr.get(root_bone_ptr, 0),
+    )
     atomic.geometry = 0
-    atomic.flags = 0x04
+    atomic.flags = 0x05
     atomic.unk = 0
 
     dff_file.geometry_list.append(geometry)
@@ -1001,6 +1330,8 @@ def run_conversion_jobs(
                 result["texture_names"] = write_txd(input_path, output_path)
             elif job["type"] == "col2":
                 result["models"] = write_col(input_path, output_path)
+            elif job["type"] == "raw":
+                shutil.copyfile(input_path, output_path)
             else:
                 raise ValueError(f"Unsupported job type: {job['type']}")
         except Exception as exc:  # pragma: no cover - exercised by live data failures
