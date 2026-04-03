@@ -67,6 +67,7 @@ class StreamedModelPlan:
     txd_name: str
     source_file: str
     placements: list[StreamedPlacement] = field(default_factory=list)
+    alternate_placement_sets: list[list[StreamedPlacement]] = field(default_factory=list)
     unresolved_name: bool = False
     has_hidden_alternates: bool = False
     export_kind: str = "world_named"
@@ -79,3 +80,4 @@ class StreamedArchivePlan:
     txd_exports: dict[str, list[int]] = field(default_factory=dict)
     summary: dict[str, int] = field(default_factory=dict)
     unresolved_names: list[str] = field(default_factory=list)
+    preloaded_level: object | None = None

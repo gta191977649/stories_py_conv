@@ -40,6 +40,7 @@ class DecodedTexture:
     rgba: bytes
     width: int
     height: int
+    has_alpha: bool
 
 
 @dataclass(slots=True)
@@ -148,12 +149,14 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
         if rgba_array is None:
             continue
         height, width, _channels = rgba_array.shape
+        has_alpha = bool(np.any(np.asarray(rgba_array, dtype=np.uint8)[:, :, 3] != 255))
         decoded.append(
             DecodedTexture(
                 name=_sanitize_texture_name(name),
                 rgba=np.asarray(rgba_array, dtype=np.uint8).tobytes(),
                 width=width,
                 height=height,
+                has_alpha=has_alpha,
             )
         )
     return decoded
@@ -162,7 +165,7 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
 def _make_txd_native(texture: DecodedTexture):
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
     rgba = bytes(texture.rgba)
-    has_alpha = any(alpha != 255 for alpha in rgba[3::4])
+    has_alpha = texture.has_alpha
     native = dragon_txd.TextureNative()
     native.platform_id = _dragon_dff.NativePlatformType.D3D9
     native.filter_mode = 0x06
@@ -234,29 +237,37 @@ def _calculate_normals(
     vertices: list[tuple[float, float, float]],
     faces: Iterable[tuple[int, int, int]],
 ) -> list[tuple[float, float, float]]:
-    accum = [(0.0, 0.0, 0.0) for _ in vertices]
-    for a, b, c in faces:
-        pa = vertices[a]
-        pb = vertices[b]
-        pc = vertices[c]
-        normal = _vector_cross(_vector_sub(pb, pa), _vector_sub(pc, pa))
-        accum[a] = _vector_add(accum[a], normal)
-        accum[b] = _vector_add(accum[b], normal)
-        accum[c] = _vector_add(accum[c], normal)
-    return [_vector_normalize(normal) for normal in accum]
+    if not vertices:
+        return []
+    face_array = np.asarray(list(faces), dtype=np.int32)
+    if face_array.size == 0:
+        return [(0.0, 0.0, 1.0)] * len(vertices)
+    vertex_array = np.asarray(vertices, dtype=np.float64)
+    pa = vertex_array[face_array[:, 0]]
+    pb = vertex_array[face_array[:, 1]]
+    pc = vertex_array[face_array[:, 2]]
+    face_normals = np.cross(pb - pa, pc - pa)
+    accum = np.zeros_like(vertex_array)
+    np.add.at(accum, face_array[:, 0], face_normals)
+    np.add.at(accum, face_array[:, 1], face_normals)
+    np.add.at(accum, face_array[:, 2], face_normals)
+    lengths = np.linalg.norm(accum, axis=1)
+    normals = np.zeros_like(accum)
+    valid = lengths > 1e-8
+    if np.any(valid):
+        normals[valid] = accum[valid] / lengths[valid, None]
+    if np.any(~valid):
+        normals[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    return [tuple(normal) for normal in normals.tolist()]
 
 
 def _calculate_bounds(vertices: list[tuple[float, float, float]]) -> tuple[tuple[float, float, float], float]:
     if not vertices:
         return (0.0, 0.0, 0.0), 0.0
-    cx = sum(vertex[0] for vertex in vertices) / len(vertices)
-    cy = sum(vertex[1] for vertex in vertices) / len(vertices)
-    cz = sum(vertex[2] for vertex in vertices) / len(vertices)
-    radius = max(
-        ((vertex[0] - cx) ** 2 + (vertex[1] - cy) ** 2 + (vertex[2] - cz) ** 2) ** 0.5
-        for vertex in vertices
-    )
-    return (cx, cy, cz), radius
+    vertex_array = np.asarray(vertices, dtype=np.float64)
+    center = vertex_array.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(vertex_array - center, axis=1)))
+    return (float(center[0]), float(center[1]), float(center[2])), radius
 
 
 def _make_materials(geo):
@@ -446,14 +457,10 @@ def _shift_vertices(
     vertices: list[tuple[float, float, float]],
     origin: tuple[float, float, float],
 ) -> list[tuple[float, float, float]]:
-    return [
-        (
-            vertex[0] - origin[0],
-            vertex[1] - origin[1],
-            vertex[2] - origin[2],
-        )
-        for vertex in vertices
-    ]
+    if not vertices:
+        return []
+    shifted = np.asarray(vertices, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+    return [tuple(vertex) for vertex in shifted.tolist()]
 
 
 def write_col(input_path: Path, output_path: Path) -> int:

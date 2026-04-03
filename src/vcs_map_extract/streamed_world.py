@@ -70,6 +70,16 @@ def _matrix_signature(values: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(round(float(value), 6) for value in values)
 
 
+def _placement_sort_key(item: "StreamedPlacement") -> tuple[int, int, int, int, int]:
+    return (
+        not item.visible,
+        SOURCE_PRIORITY[item.source_kind],
+        item.pass_index,
+        item.sector_id,
+        item.res_id,
+    )
+
+
 def _world_sector_origin(secx: int, secy: int) -> tuple[float, float, float]:
     return (
         XSTART + (XINC / 2.0) + (XINC * secx) - ((secy & 1) * (XINC / 2.0)),
@@ -592,16 +602,7 @@ def plan_streamed_archive(
             clusters.items(),
             key=lambda item: _cluster_sort_key(item[1].values()),
         )
-        placements = sorted(
-            cluster_items[0][1].values(),
-            key=lambda item: (
-                not item.visible,
-                SOURCE_PRIORITY[item.source_kind],
-                item.pass_index,
-                item.sector_id,
-                item.res_id,
-            ),
-        )
+        placements = sorted(cluster_items[0][1].values(), key=_placement_sort_key)
         model_exports.append(
             StreamedModelPlan(
                 model_name=model_name,
@@ -624,17 +625,34 @@ def plan_streamed_archive(
             clusters.items(),
             key=lambda item: _cluster_sort_key(item[1].values()),
         )
-        for cluster_index, (_cluster_key, cluster) in enumerate(cluster_items):
-            placements = sorted(
-                cluster.values(),
-                key=lambda item: (
-                    not item.visible,
-                    SOURCE_PRIORITY[item.source_kind],
-                    item.pass_index,
-                    item.sector_id,
-                    item.res_id,
-                ),
+        sorted_clusters = [
+            sorted(cluster.values(), key=_placement_sort_key)
+            for _cluster_key, cluster in cluster_items
+        ]
+        if export_kind == "interior_named" and sorted_clusters:
+            placements = sorted_clusters[0]
+            model_exports.append(
+                StreamedModelPlan(
+                    model_name=model_name,
+                    output_name=model_name,
+                    txd_name=txd_name,
+                    source_file=source_file,
+                    placements=placements,
+                    alternate_placement_sets=sorted_clusters[1:],
+                    unresolved_name=False,
+                    has_hidden_alternates=any(
+                        any(not placement.visible for placement in cluster)
+                        for cluster in sorted_clusters
+                    ),
+                    export_kind=export_kind,
+                )
             )
+            if txd_name and txd_name.lower() != "null":
+                for placements in sorted_clusters:
+                    txd_exports[txd_name].update(placement.res_id for placement in placements)
+            continue
+        for cluster_index, (_cluster_key, cluster) in enumerate(cluster_items):
+            placements = sorted(cluster.values(), key=_placement_sort_key)
             output_name = model_name
             if export_kind == "interior_fallback" and cluster_index:
                 output_name = f"{model_name}_{cluster_index}"
@@ -686,6 +704,7 @@ def plan_streamed_archive(
         txd_exports={name: sorted(res_ids) for name, res_ids in sorted(txd_exports.items())},
         summary=summary,
         unresolved_names=unresolved_names,
+        preloaded_level=level,
     )
 
 
