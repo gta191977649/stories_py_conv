@@ -250,7 +250,16 @@ class StoriesArmatureInfo:
     frame_mats_local: Dict[int, Matrix] = field(default_factory=dict)
     frame_mats_world: Dict[int, Matrix] = field(default_factory=dict)
     frame_names: Dict[int, str] = field(default_factory=dict)
+    frame_parent_ptrs: Dict[int, int] = field(default_factory=dict)
+    frame_order: List[int] = field(default_factory=list)
     root_frame_ptr: int = 0
+
+
+@dataclass
+class StoriesHierarchyBone:
+    id: int
+    index: int
+    type: int
 
 
 @dataclass
@@ -296,6 +305,8 @@ class StoriesAtomicInfo:
     vis_id_flag: int = 0
     hierarchy_ptr: int = 0
     armature: StoriesArmatureInfo = field(default_factory=StoriesArmatureInfo)
+    hierarchy_bones: List[StoriesHierarchyBone] = field(default_factory=list)
+    skin_inverse_matrices: List[Matrix] = field(default_factory=list)
     ps2_geometry: StoriesGeometryInfo = field(default_factory=StoriesGeometryInfo)
     psp_geometry: StoriesPSPGeometryInfo = field(default_factory=StoriesPSPGeometryInfo)
 
@@ -325,6 +336,9 @@ class StoriesMDLContext:
     def log(self, msg: str) -> None:
         self.debug_log.append(str(msg))
         print(msg)
+
+
+PSP_GEOMETRY_FLAG_FORMATS = {0x120, 0x121, 0x115, 0x114, 0xA1, 0x1C321}
 
 
 #######################################################
@@ -453,6 +467,13 @@ def canon_frame_name(name: str) -> str:
     return name.lower().replace("~", "_").replace(" ", "_")
 
 
+def _decode_ps2_packed_skin_weight(packed: int) -> float:
+    masked = packed & ~0xFF
+    if masked == 0:
+        return 0.0
+    return struct.unpack("<f", struct.pack("<I", masked))[0]
+
+
 def get_render_flag_names(render_flags: int) -> List[str]:
     names: List[str] = []
     if render_flags & FLAG_DRAWLAST:
@@ -481,7 +502,7 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
 
     arm.root_frame_ptr = frame_ptr
 
-    def _walk(ptr: int, parent_world: Matrix) -> None:
+    def _walk(ptr: int, parent_world: Matrix, parent_ptr: int) -> None:
         if ptr == 0:
             return
 
@@ -515,6 +536,8 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
         arm.frame_mats_local[ptr] = local_mat
         arm.frame_mats_world[ptr] = world_mat
         arm.frame_names[ptr] = bone_name
+        arm.frame_parent_ptrs[ptr] = parent_ptr
+        arm.frame_order.append(ptr)
 
         global_mat = read_global_matrix(f, ptr + 0x50)
         ctx.log(
@@ -527,12 +550,69 @@ def process_frame_tree(ctx: StoriesMDLContext, f, frame_ptr: int) -> StoriesArma
         sibling_ptr = read_u32(f)
 
         if child_ptr != 0:
-            _walk(child_ptr, world_mat)
+            _walk(child_ptr, world_mat, ptr)
         if sibling_ptr != 0:
-            _walk(sibling_ptr, parent_world)
+            _walk(sibling_ptr, parent_world, parent_ptr)
 
-    _walk(frame_ptr, Matrix.Identity(4))
+    _walk(frame_ptr, Matrix.Identity(4), 0)
     return arm
+
+
+def process_hierarchy_block(ctx: StoriesMDLContext, f, hierarchy_ptr: int) -> tuple[List[StoriesHierarchyBone], List[Matrix]]:
+    if hierarchy_ptr == 0 or hierarchy_ptr + 0x38 > ctx.file_len:
+        return [], []
+
+    cur = f.tell()
+    try:
+        f.seek(hierarchy_ptr)
+        _hier_flags = read_u32(f)
+        bone_count = read_u32(f) & 0xFF
+        if bone_count <= 0:
+            return [], []
+
+        f.seek(hierarchy_ptr + 0x30)
+        node_info_ptr = read_u32(f)
+        matrix_block_ptr = read_u32(f)
+        if not (0 < node_info_ptr < ctx.file_len):
+            return [], []
+
+        bones: List[StoriesHierarchyBone] = []
+        f.seek(node_info_ptr)
+        for _ in range(bone_count):
+            packed = read_u32(f)
+            f.seek(4, 1)
+            bones.append(
+                StoriesHierarchyBone(
+                    id=packed & 0xFF,
+                    index=(packed >> 8) & 0xFF,
+                    type=(packed >> 16) & 0xFF,
+                )
+            )
+
+        inverse_matrices: List[Matrix] = []
+        matrix_data_ptr = matrix_block_ptr + 0x10
+        if 0 < matrix_block_ptr < ctx.file_len and matrix_data_ptr + (bone_count * 64) <= ctx.file_len:
+            f.seek(matrix_data_ptr)
+            for _ in range(bone_count):
+                values = struct.unpack("<16f", f.read(64))
+                inverse_matrices.append(
+                    Matrix(
+                        (
+                            values[0:4],
+                            values[4:8],
+                            values[8:12],
+                            values[12:16],
+                        )
+                    )
+                )
+
+        ctx.log(
+            f"Hierarchy 0x{hierarchy_ptr:X}: bones={bone_count}, node_info=0x{node_info_ptr:X}, "
+            f"inv_mats={len(inverse_matrices)}"
+        )
+        return bones, inverse_matrices
+    finally:
+        f.seek(cur)
 
 
 #######################################################
@@ -846,10 +926,13 @@ def read_ps2_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesGeomet
                     weights: List[float] = []
                     for weight_index in range(4):
                         packed = read_u32_at(skin_off + (weight_index * 0x04))
-                        weight = packed & ~0xFF
+                        weight = _decode_ps2_packed_skin_weight(packed)
                         bone_index = (packed >> 2) & 0x3F
                         indices.append(0 if weight == 0 else bone_index)
-                        weights.append(weight / float(1 << 24) if weight else 0.0)
+                        weights.append(weight if weight else 0.0)
+                    total_weight = sum(weights)
+                    if total_weight > 1e-8:
+                        weights = [weight / total_weight for weight in weights]
                     strip_skin_indices.append(indices)
                     strip_skin_weights.append(weights)
 
@@ -950,8 +1033,7 @@ def read_psp_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesPSPGeo
     g.index_format = idxfmt
     g.num_weights_per_vertex = nwght
 
-    known_flag_formats = {0x120, 0x121, 0x115, 0x114, 0xA1, 0x1C321}
-    if flags not in known_flag_formats:
+    if flags not in PSP_GEOMETRY_FLAG_FORMATS:
         ctx.log(f"⚠️ Unknown PSP geometry flags format: 0x{flags:X}")
         raise Exception(f"Unknown PSP geometry flags format: 0x{flags:X}")
     else:
@@ -1029,6 +1111,9 @@ def read_psp_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesPSPGeo
     ctx.log(f"  unk3                   : {unk3}")
     ctx.log("--------------------------------")
 
+    vertex_buffer_file_offset = header_offset + offset - 168
+    max_vertex_buffer_size = max(0, ctx.file_len - vertex_buffer_file_offset)
+
     mesh_list: List[Dict[str, Any]] = []
     for i in range(num_strips):
         mesh_offset = f.tell()
@@ -1079,13 +1164,18 @@ def read_psp_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesPSPGeo
             "raw_bytes": mesh_bytes,
             "file_offset": mesh_offset,
         }
+        if m_offset >= max_vertex_buffer_size:
+            ctx.log(
+                f"⚠️ Mesh offset 0x{m_offset:X} falls outside the available PSP vertex buffer "
+                f"(max 0x{max_vertex_buffer_size:X}); stopping mesh scan at strip {i}."
+            )
+            break
         mesh_list.append(mesh_dict)
 
     ctx.log(
         f"✔ Finished reading {len(mesh_list)} sPspGeometryMesh structs (expected: {num_strips})\n"
     )
 
-    vertex_buffer_file_offset = header_offset + offset - 168
     ctx.log(f"Vertex buffer begins at file offset: 0x{vertex_buffer_file_offset:X}")
 
     f.seek(vertex_buffer_file_offset)
@@ -1235,6 +1325,20 @@ def read_psp_geometry(ctx: StoriesMDLContext, f, geom_ptr: int) -> StoriesPSPGeo
     return g
 
 
+def looks_like_psp_geometry(f, geom_ptr: int, file_len: int) -> bool:
+    if geom_ptr <= 0 or geom_ptr + 0x68 > file_len:
+        return False
+    old_pos = f.tell()
+    try:
+        f.seek(geom_ptr + 0x24)
+        flags = read_u32(f)
+        num_strips = read_u32(f)
+        offset = read_u32(f)
+        return flags in PSP_GEOMETRY_FLAG_FORMATS and 0 < num_strips <= 0x400 and offset < file_len
+    finally:
+        f.seek(old_pos)
+
+
 #######################################################
 # === Top-level Stories MDL reader as a class ===
 class read_stories:
@@ -1302,30 +1406,38 @@ class read_stories:
                 }
                 return val in KNOWN_VTABLES or (val & 0xFFFF) in {v & 0xFFFF for v in KNOWN_VTABLES}
 
+            def classify_top_level_candidate(ptr_value: int) -> tuple[str, int | None, str]:
+                if is_known_vtable(ptr_value):
+                    return "inline_magic", None, ""
+                if 0 < ptr_value < ctx.file_len:
+                    f.seek(ptr_value)
+                    peek_bytes = f.read(8)
+                    s = peek_bytes.split(b"\x00")[0]
+                    if s and all(32 <= b <= 126 for b in s):
+                        return "string", None, s.decode("ascii", errors="ignore")
+                    if len(peek_bytes) >= 4:
+                        val = struct.unpack("<I", peek_bytes[:4])[0]
+                        if is_known_vtable(val):
+                            return "pointer_to_magic", ptr_value, ""
+                    return "struct_or_flags", None, ""
+                if 32 <= (ptr_value & 0xFF) <= 126:
+                    return "string_candidate", None, ""
+                return "unknown", None, ""
+
             peek_type = "unknown"
             string_val = ""
+            resolved_top_level_ptr: int | None = None
             file_current = f.tell()
-            if 0 < possible_ptr < ctx.file_len:
-                f.seek(possible_ptr)
-                peek_bytes = f.read(8)
-                s = peek_bytes.split(b"\x00")[0]
-                if s and all(32 <= b <= 126 for b in s):
-                    string_val = s.decode("ascii", errors="ignore")
-                    peek_type = "string"
-                else:
-                    val = struct.unpack("<I", peek_bytes[:4])[0]
-                    if is_known_vtable(val):
-                        peek_type = "vtable"
-                    else:
-                        peek_type = "struct_or_flags"
-                f.seek(file_current)
+            candidate_kind, candidate_ptr, string_val = classify_top_level_candidate(possible_ptr)
+            if candidate_kind == "pointer_to_magic":
+                peek_type = "vtable"
+                resolved_top_level_ptr = candidate_ptr
+            elif candidate_kind == "inline_magic":
+                peek_type = "vtable"
+                resolved_top_level_ptr = next_ptr_offset
             else:
-                if is_known_vtable(possible_ptr):
-                    peek_type = "vtable"
-                elif 32 <= (possible_ptr & 0xFF) <= 126:
-                    peek_type = "string_candidate"
-                else:
-                    peek_type = "unknown"
+                peek_type = candidate_kind
+            f.seek(file_current)
             ctx.log(
                 f"Analysis: pointer after allocMem is {peek_type}"
                 + (f" ('{string_val}')" if string_val else "")
@@ -1334,8 +1446,13 @@ class read_stories:
             renderflags_offset = 0
 
             if peek_type == "vtable":
-                ctx.log("This pointer is a vtable/top-level struct (Clump/Atomic etc).")
-                ctx.top_level_ptr = possible_ptr
+                if resolved_top_level_ptr == next_ptr_offset:
+                    ctx.log(
+                        "Found inline top-level magic after allocMem; using the current file offset as the Clump/Atomic header."
+                    )
+                else:
+                    ctx.log("This pointer is a vtable/top-level struct (Clump/Atomic etc).")
+                ctx.top_level_ptr = resolved_top_level_ptr if resolved_top_level_ptr is not None else possible_ptr
             elif peek_type in ("string", "string_candidate"):
                 ctx.log(
                     f"This pointer is a string (probably a material/texture name): '{string_val}'"
@@ -1345,9 +1462,23 @@ class read_stories:
                     "This pointer appears to point to a struct or flags; treat as renderflags offset or substruct."
                 )
                 renderflags_offset = possible_ptr
-                if mdl_type == "SIM":
-                    f.seek(-4, 1)
-                ctx.top_level_ptr = read_u32(f)
+                fallback_ptr = read_u32(f)
+                fallback_kind, fallback_target, _fallback_string = classify_top_level_candidate(fallback_ptr)
+                f.seek(file_current)
+                if fallback_kind == "pointer_to_magic":
+                    ctx.top_level_ptr = fallback_target if fallback_target is not None else fallback_ptr
+                    ctx.log(
+                        f"Resolved next header DWORD 0x{fallback_ptr:X} to top-level struct at 0x{ctx.top_level_ptr:X}."
+                    )
+                elif fallback_kind == "inline_magic":
+                    ctx.top_level_ptr = file_current
+                    ctx.log(
+                        f"Treating 0x{fallback_ptr:X} as inline top-level magic at 0x{ctx.top_level_ptr:X}."
+                    )
+                else:
+                    if mdl_type == "SIM":
+                        f.seek(-4, 1)
+                    ctx.top_level_ptr = read_u32(f)
             else:
                 ctx.log("Pointer after allocMem type could not be determined; treating as unknown/flags.")
                 renderflags_offset = possible_ptr
@@ -1371,7 +1502,7 @@ class read_stories:
             LCSATOMIC1 = 0x01050001
             LCSATOMIC2 = 0x01000001
             VCSATOMIC1 = 0x0004AA01
-            VCSATOMIC2 = 0x0004AA01
+            VCSATOMIC2 = 0x0300AA00
             VCSATOMICPSP1 = 0x00041601
             VCSATOMICPSP2 = 0x01F40400
 
@@ -1460,10 +1591,18 @@ class read_stories:
                     except Exception as e:
                         ctx.log(f"⚠️ Failed to build armature: {e}")
                         atomic_info.armature = None
+                    try:
+                        bones, inverse_matrices = process_hierarchy_block(ctx, f, hierarchy_ptr)
+                        atomic_info.hierarchy_bones = bones
+                        atomic_info.skin_inverse_matrices = inverse_matrices
+                    except Exception as e:
+                        ctx.log(f"⚠️ Failed to parse hierarchy block: {e}")
 
-                if platform == "PS2":
+                if platform == "PS2" and not looks_like_psp_geometry(f, geom_ptr, ctx.file_len):
                     atomic_info.ps2_geometry = read_ps2_geometry(ctx, f, geom_ptr)
                 else:
+                    if platform == "PS2":
+                        ctx.log("Detected PSP-style geometry payload inside PS2 MDL; using PSP geometry reader.")
                     atomic_info.psp_geometry = read_psp_geometry(ctx, f, geom_ptr)
 
         txt_path = os.path.splitext(filepath)[0] + "_import_log.txt"

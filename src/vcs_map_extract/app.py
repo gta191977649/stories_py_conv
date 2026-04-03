@@ -71,56 +71,76 @@ def _queue_standard_jobs(
         summary[archive_name]["img_entries"] = len(entries)
         if on_archive_done is None:
             _log(f"[standard] scanning {archive_name}: {len(entries)} IMG entries")
+        model_output_by_entry: dict[str, str] = {}
+        col_output_by_entry: dict[str, str] = {}
+        for ide_model in ide_catalog.values():
+            output_stem = sanitize_filename(resolver.canonical_model_name(ide_model.model_id, ide_model.model_name))
+            model_output_by_entry.setdefault(f"{ide_model.model_name}.mdl".lower(), output_stem)
+            col_output_by_entry.setdefault(f"{ide_model.model_name}.col2".lower(), output_stem)
         queued_models: set[str] = set()
         queued_txds: set[str] = set()
         queued_cols: set[str] = set()
         queued_output_models: set[str] = set()
         queued_output_cols: set[str] = set()
+        texture_priority = {ext: index for index, ext in enumerate(TEXTURE_EXTENSIONS)}
+        chosen_texture_entries: dict[str, ImgDirectoryEntry] = {}
+        texture_output_names: dict[str, str] = {}
 
-        for ide_model in ide_catalog.values():
-            mdl_key = f"{ide_model.model_name}.mdl".lower()
-            if mdl_key in entries and mdl_key not in queued_models:
-                output_stem = sanitize_filename(resolver.canonical_model_name(ide_model.model_id, ide_model.model_name))
-                if output_stem in queued_output_models:
-                    queued_models.add(mdl_key)
-                else:
-                    queued_output_models.add(output_stem)
-                    queued_models.add(mdl_key)
-                    entry = entries[mdl_key]
-                    raw_path = temp_root / archive_name / entry.name
-                    safe_mkdir(raw_path.parent)
-                    raw_path.write_bytes(reader.read_entry(entry))
-                    output_path = archive_dir / f"{output_stem}.dff"
-                    jobs.append({"type": "mdl", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
+        for entry in reader.entries:
+            entry_path = Path(entry.name)
+            entry_key = entry.name.lower()
+            suffix = entry_path.suffix.lower()
+            base_name = entry_path.stem
 
-            txd_base = ide_model.txd_name.lower()
-            if txd_base and txd_base != "null":
-                for ext in TEXTURE_EXTENSIONS:
-                    txd_key = f"{txd_base}{ext}"
-                    if txd_key not in entries or txd_key in queued_txds:
-                        continue
-                    queued_txds.add(txd_key)
-                    entry = entries[txd_key]
-                    raw_path = temp_root / archive_name / entry.name
-                    safe_mkdir(raw_path.parent)
-                    raw_path.write_bytes(reader.read_entry(entry))
-                    output_path = archive_dir / f"{sanitize_filename(ide_model.txd_name)}.txd"
-                    jobs.append({"type": "tex", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
-                    break
-
-            col_key = f"{ide_model.model_name}.col2".lower()
-            if col_key in entries and col_key not in queued_cols:
-                output_stem = sanitize_filename(resolver.canonical_model_name(ide_model.model_id, ide_model.model_name))
-                queued_cols.add(col_key)
-                if output_stem in queued_output_cols:
+            if suffix == ".mdl":
+                output_stem = model_output_by_entry.get(entry_key, sanitize_filename(base_name))
+                output_key = output_stem.lower()
+                if output_key in queued_output_models:
                     continue
-                queued_output_cols.add(output_stem)
-                entry = entries[col_key]
+                queued_output_models.add(output_key)
+                queued_models.add(entry_key)
+                raw_path = temp_root / archive_name / entry.name
+                safe_mkdir(raw_path.parent)
+                raw_path.write_bytes(reader.read_entry(entry))
+                output_path = archive_dir / f"{output_stem}.dff"
+                jobs.append({"type": "mdl", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
+                continue
+
+            if suffix == ".col2":
+                output_stem = col_output_by_entry.get(entry_key, sanitize_filename(base_name))
+                output_key = output_stem.lower()
+                if output_key in queued_output_cols:
+                    continue
+                queued_output_cols.add(output_key)
+                queued_cols.add(entry_key)
                 raw_path = temp_root / archive_name / entry.name
                 safe_mkdir(raw_path.parent)
                 raw_path.write_bytes(reader.read_entry(entry))
                 output_path = archive_dir / f"{output_stem}.col"
                 jobs.append({"type": "col2", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
+                continue
+
+            if suffix not in TEXTURE_EXTENSIONS:
+                continue
+
+            output_stem = sanitize_filename(base_name)
+            output_key = output_stem.lower()
+            current = chosen_texture_entries.get(output_key)
+            if current is not None:
+                current_suffix = Path(current.name).suffix.lower()
+                if texture_priority.get(suffix, len(TEXTURE_EXTENSIONS)) >= texture_priority.get(current_suffix, len(TEXTURE_EXTENSIONS)):
+                    continue
+            chosen_texture_entries[output_key] = entry
+            texture_output_names[output_key] = output_stem
+
+        for output_key in sorted(chosen_texture_entries):
+            entry = chosen_texture_entries[output_key]
+            queued_txds.add(entry.name.lower())
+            raw_path = temp_root / archive_name / entry.name
+            safe_mkdir(raw_path.parent)
+            raw_path.write_bytes(reader.read_entry(entry))
+            output_path = archive_dir / f"{texture_output_names[output_key]}.txd"
+            jobs.append({"type": "tex", "archive": archive_name, "input": str(raw_path), "output": str(output_path)})
 
         summary[archive_name]["queued_models"] = len(queued_models)
         summary[archive_name]["queued_txds"] = len(queued_txds)

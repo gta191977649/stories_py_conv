@@ -595,6 +595,7 @@ def plan_streamed_archive(
                     cluster[instance.res_id] = placement
 
     model_exports: list[StreamedModelPlan] = []
+    named_plan_by_name: dict[str, StreamedModelPlan] = {}
     for model_name in sorted(world_contributions):
         txd_name, source_file = world_model_meta[model_name]
         clusters = world_contributions[model_name]
@@ -603,20 +604,25 @@ def plan_streamed_archive(
             key=lambda item: _cluster_sort_key(item[1].values()),
         )
         placements = sorted(cluster_items[0][1].values(), key=_placement_sort_key)
-        model_exports.append(
-            StreamedModelPlan(
-                model_name=model_name,
-                output_name=model_name,
-                txd_name=txd_name,
-                source_file=source_file,
-                placements=placements,
-                unresolved_name=False,
-                has_hidden_alternates=model_hidden_alternates[model_name],
-                export_kind="world_named",
-            )
+        plan = StreamedModelPlan(
+            model_name=model_name,
+            output_name=model_name,
+            txd_name=txd_name,
+            source_file=source_file,
+            placements=placements,
+            alternate_placement_sets=[
+                sorted(cluster.values(), key=_placement_sort_key)
+                for _cluster_key, cluster in cluster_items[1:]
+            ],
+            unresolved_name=False,
+            has_hidden_alternates=model_hidden_alternates[model_name],
+            export_kind="world_named",
         )
+        model_exports.append(plan)
+        named_plan_by_name[model_name] = plan
         if txd_name and txd_name.lower() != "null":
-            txd_exports[txd_name].update(placement.res_id for placement in placements)
+            for cluster_placements in [placements, *plan.alternate_placement_sets]:
+                txd_exports[txd_name].update(placement.res_id for placement in cluster_placements)
 
     for model_name in sorted(interior_contributions):
         txd_name, source_file, export_kind = interior_model_meta[model_name]
@@ -630,6 +636,20 @@ def plan_streamed_archive(
             for _cluster_key, cluster in cluster_items
         ]
         if export_kind == "interior_named" and sorted_clusters:
+            existing_named_plan = named_plan_by_name.get(model_name)
+            if existing_named_plan is not None:
+                existing_named_plan.alternate_placement_sets.extend(sorted_clusters)
+                existing_named_plan.has_hidden_alternates = (
+                    existing_named_plan.has_hidden_alternates
+                    or any(
+                        any(not placement.visible for placement in cluster)
+                        for cluster in sorted_clusters
+                    )
+                )
+                if txd_name and txd_name.lower() != "null":
+                    for placements in sorted_clusters:
+                        txd_exports[txd_name].update(placement.res_id for placement in placements)
+                continue
             placements = sorted_clusters[0]
             model_exports.append(
                 StreamedModelPlan(

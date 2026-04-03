@@ -305,6 +305,304 @@ def _make_materials(geo):
     return materials
 
 
+def _invert_matrix4(matrix: object) -> tuple[tuple[float, float, float, float], ...]:
+    array = np.asarray(tuple(tuple(float(value) for value in row) for row in matrix), dtype=np.float64)
+    inverted = np.linalg.inv(array)
+    return tuple(tuple(float(value) for value in row) for row in inverted.tolist())
+
+
+def _matrix_to_frame_components(matrix: object):
+    dragon_dff, _dragon_txd, _dragon_col = load_dragonff_modules()
+    rows = tuple(tuple(float(value) for value in row) for row in matrix)
+    return (
+        dragon_dff.Matrix(
+            dragon_dff.Vector(rows[0][0], rows[1][0], rows[2][0]),
+            dragon_dff.Vector(rows[0][1], rows[1][1], rows[2][1]),
+            dragon_dff.Vector(rows[0][2], rows[1][2], rows[2][2]),
+        ),
+        dragon_dff.Vector(rows[0][3], rows[1][3], rows[2][3]),
+    )
+
+
+def _collect_part_skin(part) -> tuple[list[list[int]], list[list[float]]]:
+    skin_indices = [[0, 0, 0, 0] for _ in part.verts]
+    skin_weights = [[0.0, 0.0, 0.0, 0.0] for _ in part.verts]
+    for strip in getattr(part, "strips_meta", []):
+        for vertex_offset in range(min(strip.vertex_count, len(strip.skin_indices), len(strip.skin_weights))):
+            vertex_index = strip.base_vertex_index + vertex_offset
+            if not (0 <= vertex_index < len(skin_indices)):
+                continue
+            indices = list(strip.skin_indices[vertex_offset][:4])
+            weights = list(strip.skin_weights[vertex_offset][:4])
+            while len(indices) < 4:
+                indices.append(0)
+            while len(weights) < 4:
+                weights.append(0.0)
+            total_weight = sum(float(weight) for weight in weights)
+            if total_weight > 1e-8:
+                weights = [float(weight) / total_weight for weight in weights]
+            skin_indices[vertex_index] = [int(index) for index in indices[:4]]
+            skin_weights[vertex_index] = [float(weight) for weight in weights[:4]]
+    return skin_indices, skin_weights
+
+
+def _context_has_skin(ctx) -> bool:
+    if getattr(ctx.atomic, "hierarchy_bones", None):
+        return True
+    ps2_geo = ctx.atomic.ps2_geometry
+    for part in getattr(ps2_geo, "parts", []):
+        for strip in getattr(part, "strips_meta", []):
+            if getattr(strip, "skin_indices", None):
+                return True
+    psp_geo = ctx.atomic.psp_geometry
+    return any(getattr(mesh, "bone_indices", None) for mesh in getattr(psp_geo, "meshes", []))
+
+
+def _default_ped_bone_records(mdl_mod, armature) -> list[tuple[int, int, int, str, int]]:
+    name_to_ptr = {
+        mdl_mod.canon_frame_name(name): ptr
+        for ptr, name in armature.frame_names.items()
+    }
+    records: list[tuple[int, int, int, str, int]] = []
+    for index, canonical_name in enumerate(mdl_mod.commonBoneOrderVCS):
+        ptr = name_to_ptr.get(canonical_name)
+        if ptr is None:
+            continue
+        records.append(
+            (
+                int(mdl_mod.kamBoneIDVCS[index]),
+                index,
+                int(mdl_mod.kamBoneTypeVCS[index]),
+                canonical_name,
+                ptr,
+            )
+        )
+    return records
+
+
+def _ped_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
+    armature = ctx.atomic.armature
+    name_to_ptr = {
+        mdl_mod.canon_frame_name(name): ptr
+        for ptr, name in armature.frame_names.items()
+    }
+    hierarchy_bones = list(getattr(ctx.atomic, "hierarchy_bones", []))
+    records: list[tuple[int, int, int, str, int]] = []
+    for bone in hierarchy_bones:
+        if 0 <= bone.index < len(mdl_mod.commonBoneOrderVCS):
+            canonical_name = mdl_mod.commonBoneOrderVCS[bone.index]
+        else:
+            canonical_name = ""
+        ptr = name_to_ptr.get(canonical_name)
+        if ptr is None:
+            continue
+        records.append((int(bone.id), int(bone.index), int(bone.type), canonical_name, ptr))
+    return records or _default_ped_bone_records(mdl_mod, armature)
+
+
+def _skin_inverse_matrices(ctx, bone_records: list[tuple[int, int, int, str, int]]) -> list[tuple[tuple[float, float, float, float], ...]]:
+    matrices = list(getattr(ctx.atomic, "skin_inverse_matrices", []))
+    if len(matrices) == len(bone_records):
+        return [
+            tuple(tuple(float(value) for value in row) for row in matrix)
+            for matrix in matrices
+        ]
+    armature = ctx.atomic.armature
+    return [_invert_matrix4(armature.frame_mats_world[ptr]) for _bone_id, _index, _type, _name, ptr in bone_records]
+
+
+def _write_skinned_clump(ctx, output_path: Path, frame_name: str) -> None:
+    mdl_mod, _tex_mod, _col2_mod = load_bleeds_modules()
+    dragon_dff, _dragon_txd, _dragon_col = load_dragonff_modules()
+
+    bone_records = _ped_bone_records(ctx, mdl_mod)
+    if not bone_records:
+        raise ValueError("No ped hierarchy frames were resolved")
+
+    armature = ctx.atomic.armature
+    frame_ptrs = [ptr for _bone_id, _index, _type, _name, ptr in bone_records]
+    frame_index_by_ptr = {ptr: index for index, ptr in enumerate(frame_ptrs)}
+
+    vertices: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    uvs: list[tuple[float, float]] = []
+    face_materials: list[str] = []
+    vertex_colors: list[tuple[int, int, int, int]] = []
+    vertex_bone_indices: list[list[int]] = []
+    vertex_bone_weights: list[list[float]] = []
+
+    ps2_geo = ctx.atomic.ps2_geometry
+    if ps2_geo.parts:
+        for part in ps2_geo.parts:
+            base_index = len(vertices)
+            vertices.extend(tuple(map(float, vertex)) for vertex in part.verts)
+
+            part_uvs = list(getattr(part, "uvs", []))
+            for vertex_index in range(len(part.verts)):
+                if vertex_index < len(part_uvs):
+                    u, v = part_uvs[vertex_index]
+                else:
+                    u, v = 0.0, 0.0
+                uvs.append((float(u), float(v)))
+
+            part_colors = list(getattr(part, "vertex_colors", []))
+            for vertex_index in range(len(part.verts)):
+                if vertex_index < len(part_colors):
+                    r, g, b, a = part_colors[vertex_index]
+                    vertex_colors.append((int(r), int(g), int(b), int(a)))
+                else:
+                    vertex_colors.append((255, 255, 255, 255))
+
+            part_skin_indices, part_skin_weights = _collect_part_skin(part)
+            for indices, weights in zip(part_skin_indices, part_skin_weights, strict=True):
+                if sum(weights) <= 1e-8:
+                    vertex_bone_indices.append([0, 0, 0, 0])
+                    vertex_bone_weights.append([1.0, 0.0, 0.0, 0.0])
+                else:
+                    vertex_bone_indices.append([int(index) for index in indices[:4]])
+                    vertex_bone_weights.append([float(weight) for weight in weights[:4]])
+
+            material_index = int(getattr(part, "material_id", 0))
+            material_name = (
+                getattr(ps2_geo.materials[material_index], "texture", "")
+                if material_index < len(ps2_geo.materials)
+                else ""
+            )
+            for face in part.faces:
+                a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
+                faces.append((a, b, c))
+                face_materials.append(material_name)
+    else:
+        psp_geo = ctx.atomic.psp_geometry
+        for mesh in psp_geo.meshes:
+            base_index = len(vertices)
+            vertices.extend(tuple(map(float, vertex)) for vertex in mesh.verts)
+
+            mesh_uvs = list(getattr(mesh, "uvs", []))
+            for vertex_index in range(len(mesh.verts)):
+                if vertex_index < len(mesh_uvs):
+                    u, v = mesh_uvs[vertex_index]
+                else:
+                    u, v = 0.0, 0.0
+                uvs.append((float(u), float(v)))
+
+            mesh_colors = list(getattr(mesh, "colors", []))
+            for vertex_index in range(len(mesh.verts)):
+                if vertex_index < len(mesh_colors):
+                    r, g, b, a = mesh_colors[vertex_index]
+                    vertex_colors.append((int(r), int(g), int(b), int(a)))
+                else:
+                    vertex_colors.append((255, 255, 255, 255))
+
+            mesh_indices = list(getattr(mesh, "bone_indices", []))
+            mesh_weights = list(getattr(mesh, "bone_weights", []))
+            for vertex_index in range(len(mesh.verts)):
+                indices = list(mesh_indices[vertex_index][:4]) if vertex_index < len(mesh_indices) else [0, 0, 0, 0]
+                weights = list(mesh_weights[vertex_index][:4]) if vertex_index < len(mesh_weights) else [1.0, 0.0, 0.0, 0.0]
+                while len(indices) < 4:
+                    indices.append(0)
+                while len(weights) < 4:
+                    weights.append(0.0)
+                total_weight = sum(float(weight) for weight in weights)
+                if total_weight <= 1e-8:
+                    vertex_bone_indices.append([0, 0, 0, 0])
+                    vertex_bone_weights.append([1.0, 0.0, 0.0, 0.0])
+                else:
+                    vertex_bone_indices.append([int(index) for index in indices[:4]])
+                    vertex_bone_weights.append([float(weight) / total_weight for weight in weights[:4]])
+
+            material_index = int(getattr(mesh, "mat_id", 0))
+            material_name = (
+                getattr(psp_geo.materials[material_index], "texture", "")
+                if material_index < len(psp_geo.materials)
+                else ""
+            )
+            for face in mesh.faces:
+                a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
+                faces.append((a, b, c))
+                face_materials.append(material_name)
+
+    if not vertices or not faces:
+        raise ValueError(f"No skinned geometry data available for {output_path}")
+
+    normals = _calculate_normals(vertices, faces)
+    (cx, cy, cz), radius = _calculate_bounds(vertices)
+
+    material_names: list[str] = []
+    seen_material_names: set[str] = set()
+    for name in face_materials:
+        if not name or name in seen_material_names:
+            continue
+        seen_material_names.add(name)
+        material_names.append(name)
+    material_slot = {name: index for index, name in enumerate(material_names)}
+    materials = []
+    for name in material_names:
+        mat = dragon_dff.Material()
+        mat.flags = 0
+        mat.color = dragon_dff.RGBA(255, 255, 255, 255)
+        mat.surface_properties = dragon_dff.GeomSurfPro(1.0, 1.0, 1.0)
+        texture = dragon_dff.Texture()
+        texture.filters = 0x06
+        texture.uv_addressing = 0b00010001
+        texture.name = _sanitize_texture_name(name)
+        texture.mask = ""
+        mat.textures = [texture]
+        materials.append(mat)
+
+    geometry = dragon_dff.Geometry()
+    geometry.surface_properties = dragon_dff.GeomSurfPro(1.0, 1.0, 1.0)
+    geometry.vertices = [dragon_dff.Vector(*vertex) for vertex in vertices]
+    geometry.normals = [dragon_dff.Vector(*normal) for normal in normals]
+    geometry.uv_layers = [[dragon_dff.TexCoords(float(u), float(v)) for u, v in uvs]]
+    geometry.prelit_colors = [dragon_dff.RGBA(*color) for color in vertex_colors]
+    geometry.triangles = [
+        dragon_dff.Triangle(b, a, material_slot.get(face_materials[index], 0), c)
+        for index, (a, b, c) in enumerate(faces)
+    ]
+    geometry.materials = materials or _make_materials(SimpleNamespace(materials=[], parts=[SimpleNamespace(material_id=0)]))
+    geometry.bounding_sphere = dragon_dff.Sphere(cx, cy, cz, radius)
+
+    skin = dragon_dff.SkinPLG()
+    skin.num_bones = len(bone_records)
+    skin.vertex_bone_indices = vertex_bone_indices
+    skin.vertex_bone_weights = vertex_bone_weights
+    skin.bone_matrices = _skin_inverse_matrices(ctx, bone_records)
+    geometry.extensions["skin"] = skin
+
+    root_bone_id = int(bone_records[0][0])
+    root_frame_index = 0
+
+    dff_file = dragon_dff.dff()
+    for bone_list_index, (bone_id, bone_index, bone_type, _canonical_name, ptr) in enumerate(bone_records):
+        frame = dragon_dff.Frame()
+        frame.rotation_matrix, frame.position = _matrix_to_frame_components(armature.frame_mats_local[ptr])
+        parent_ptr = armature.frame_parent_ptrs.get(ptr, 0)
+        frame.parent = frame_index_by_ptr[parent_ptr] if parent_ptr in frame_index_by_ptr else -1
+        if frame.parent < 0:
+            root_frame_index = bone_list_index
+        frame.creation_flags = 0
+        frame.name = armature.frame_names.get(ptr, frame_name)
+        frame.bone_data = dragon_dff.HAnimPLG()
+        frame.bone_data.header = dragon_dff.HAnimHeader(0x100, int(bone_id), len(bone_records) if bone_list_index == root_frame_index else 0)
+        if bone_list_index == root_frame_index:
+            frame.bone_data.bones = [
+                dragon_dff.Bone(int(entry_bone_id), int(entry_index), int(entry_type))
+                for entry_bone_id, entry_index, entry_type, _entry_name, _entry_ptr in bone_records
+            ]
+        dff_file.frame_list.append(frame)
+
+    atomic = dragon_dff.Atomic()
+    atomic.frame = root_frame_index
+    atomic.geometry = 0
+    atomic.flags = 0x04
+    atomic.unk = 0
+
+    dff_file.geometry_list.append(geometry)
+    dff_file.atomic_list.append(atomic)
+    output_path.write_bytes(dff_file.write_memory(RW_VERSION))
+
+
 def write_dff_from_mesh(mesh: MeshData, output_path: Path, frame_name: str) -> None:
     dragon_dff, _dragon_txd, _dragon_col = load_dragonff_modules()
     if not mesh.vertices or not mesh.faces:
@@ -373,60 +671,154 @@ def write_dff_from_mesh(mesh: MeshData, output_path: Path, frame_name: str) -> N
     output_path.write_bytes(dff_file.write_memory(RW_VERSION))
 
 
-def write_dff(input_path: Path, output_path: Path) -> None:
-    mdl_mod, _tex_mod, _col2_mod = load_bleeds_modules()
+def write_empty_dff(output_path: Path, frame_name: str) -> None:
     dragon_dff, _dragon_txd, _dragon_col = load_dragonff_modules()
+    frame = dragon_dff.Frame()
+    frame.rotation_matrix = dragon_dff.Matrix(
+        dragon_dff.Vector(1.0, 0.0, 0.0),
+        dragon_dff.Vector(0.0, 1.0, 0.0),
+        dragon_dff.Vector(0.0, 0.0, 1.0),
+    )
+    frame.position = dragon_dff.Vector(0.0, 0.0, 0.0)
+    frame.parent = -1
+    frame.creation_flags = 0
+    frame.name = frame_name
 
-    ctx = mdl_mod.read_stories_mdl(str(input_path), "PS2", "SIM")
-    geo = ctx.atomic.ps2_geometry
-    if not geo.parts:
-        raise ValueError(f"No PS2 geometry parts decoded from {input_path}")
+    dff_file = dragon_dff.dff()
+    dff_file.frame_list.append(frame)
+    output_path.write_bytes(dff_file.write_memory(RW_VERSION))
+
+
+def _read_ps2_mdl_context(input_path: Path):
+    mdl_mod, _tex_mod, _col2_mod = load_bleeds_modules()
+    attempts: list[str] = []
+    candidates: list[tuple[int, object]] = []
+    for mdl_type in ("SIM", "PED"):
+        try:
+            ctx = mdl_mod.read_stories_mdl(str(input_path), "PS2", mdl_type)
+        except Exception as exc:
+            attempts.append(f"{mdl_type}: {exc}")
+            continue
+        ps2_geo = ctx.atomic.ps2_geometry
+        psp_geo = ctx.atomic.psp_geometry
+        if ps2_geo.parts or psp_geo.meshes:
+            score = 0
+            armature = getattr(ctx.atomic, "armature", SimpleNamespace(frame_names={}))
+            if getattr(ctx, "mdl_type", "") == "PED":
+                score += 10
+            if _context_has_skin(ctx):
+                score += 100
+            score += len(getattr(armature, "frame_names", {}))
+            score += len(getattr(ctx.atomic, "hierarchy_bones", []))
+            candidates.append((score, ctx))
+            continue
+        attempts.append(f"{mdl_type}: no geometry parts or meshes")
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    details = "; ".join(attempts) if attempts else "no parser attempts made"
+    raise ValueError(f"No PS2 geometry parts or PSP meshes decoded from {input_path} ({details})")
+
+
+def write_dff(input_path: Path, output_path: Path) -> None:
+    frame_name = sanitize_filename(input_path.stem)
+    try:
+        ctx = _read_ps2_mdl_context(input_path)
+    except ValueError:
+        # Preserve archive completeness for unsupported or non-renderable MDLs.
+        write_empty_dff(output_path, frame_name)
+        return
+
+    if getattr(ctx, "mdl_type", "") == "PED" and _context_has_skin(ctx):
+        try:
+            _write_skinned_clump(ctx, output_path, frame_name)
+            return
+        except Exception:
+            # Fall back to static export if skeletal conversion still fails.
+            pass
 
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int]] = []
-    triangles = []
-    uvs = []
+    face_materials: list[str] = []
+    uvs: list[tuple[float, float]] = []
     vertex_colors: list[tuple[int, int, int, int]] = []
 
-    for part in geo.parts:
-        base_index = len(vertices)
-        part_vertices = [tuple(map(float, vertex)) for vertex in part.verts]
-        vertices.extend(part_vertices)
+    ps2_geo = ctx.atomic.ps2_geometry
+    if ps2_geo.parts:
+        for part in ps2_geo.parts:
+            base_index = len(vertices)
+            part_vertices = [tuple(map(float, vertex)) for vertex in part.verts]
+            vertices.extend(part_vertices)
 
-        part_uvs = list(getattr(part, "uvs", []))
-        for vertex_index in range(len(part_vertices)):
-            if vertex_index < len(part_uvs):
-                u, v = part_uvs[vertex_index]
-            else:
-                u, v = 0.0, 0.0
-            # PS2 MDL UVs already match the reference DFF convention.
-            uvs.append(dragon_dff.TexCoords(float(u), float(v)))
+            part_uvs = list(getattr(part, "uvs", []))
+            for vertex_index in range(len(part_vertices)):
+                if vertex_index < len(part_uvs):
+                    u, v = part_uvs[vertex_index]
+                else:
+                    u, v = 0.0, 0.0
+                # PS2 MDL UVs already match the reference DFF convention.
+                uvs.append((float(u), float(v)))
 
-        part_colors = list(getattr(part, "vertex_colors", []))
-        for vertex_index in range(len(part_vertices)):
-            if vertex_index < len(part_colors):
-                r, g, b, a = part_colors[vertex_index]
-                vertex_colors.append((int(r), int(g), int(b), int(a)))
-            else:
-                vertex_colors.append((255, 255, 255, 255))
+            part_colors = list(getattr(part, "vertex_colors", []))
+            for vertex_index in range(len(part_vertices)):
+                if vertex_index < len(part_colors):
+                    r, g, b, a = part_colors[vertex_index]
+                    vertex_colors.append((int(r), int(g), int(b), int(a)))
+                else:
+                    vertex_colors.append((255, 255, 255, 255))
 
-        material_index = int(getattr(part, "material_id", 0))
-        for face in part.faces:
-            a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
-            faces.append((a, b, c))
-            triangles.append(dragon_dff.Triangle(b, a, material_index, c))
+            material_index = int(getattr(part, "material_id", 0))
+            material_name = (
+                getattr(ps2_geo.materials[material_index], "texture", "")
+                if material_index < len(ps2_geo.materials)
+                else ""
+            )
+            for face in part.faces:
+                a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
+                faces.append((a, b, c))
+                face_materials.append(material_name)
+    else:
+        psp_geo = ctx.atomic.psp_geometry
+        for mesh in psp_geo.meshes:
+            base_index = len(vertices)
+            mesh_vertices = [tuple(map(float, vertex)) for vertex in mesh.verts]
+            vertices.extend(mesh_vertices)
+
+            mesh_uvs = list(getattr(mesh, "uvs", []))
+            for vertex_index in range(len(mesh_vertices)):
+                if vertex_index < len(mesh_uvs):
+                    u, v = mesh_uvs[vertex_index]
+                else:
+                    u, v = 0.0, 0.0
+                uvs.append((float(u), float(v)))
+
+            mesh_colors = list(getattr(mesh, "colors", []))
+            for vertex_index in range(len(mesh_vertices)):
+                if vertex_index < len(mesh_colors):
+                    r, g, b, a = mesh_colors[vertex_index]
+                    vertex_colors.append((int(r), int(g), int(b), int(a)))
+                else:
+                    vertex_colors.append((255, 255, 255, 255))
+
+            material_index = int(getattr(mesh, "mat_id", 0))
+            material_name = (
+                getattr(psp_geo.materials[material_index], "texture", "")
+                if material_index < len(psp_geo.materials)
+                else ""
+            )
+            for face in mesh.faces:
+                a, b, c = (base_index + int(face[0]), base_index + int(face[1]), base_index + int(face[2]))
+                faces.append((a, b, c))
+                face_materials.append(material_name)
 
     mesh = MeshData(
         vertices=vertices,
         faces=faces,
-        uvs=[(uv.u, uv.v) for uv in uvs],
-        face_materials=[
-            getattr(geo.materials[triangle.material], "texture", "") if triangle.material < len(geo.materials) else ""
-            for triangle in triangles
-        ],
+        uvs=uvs,
+        face_materials=face_materials,
         vertex_colors=vertex_colors,
     )
-    write_dff_from_mesh(mesh, output_path, sanitize_filename(input_path.stem))
+    write_dff_from_mesh(mesh, output_path, frame_name)
 
 
 def _build_box_mesh(aabb_min: tuple[float, float, float, float], aabb_max: tuple[float, float, float, float]):

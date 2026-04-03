@@ -1392,12 +1392,11 @@ def export_streamed_archive(
                     if base_stem in used_output_stems:
                         diagnostics.append(
                             f"{archive_name}: skipped interior export for {model.model_name} from sector={candidate_placements[0].sector_id}, "
-                            f"res_id={candidate_placements[0].res_id} because only exact IDE model names are allowed in main output"
+                            f"res_id={candidate_placements[0].res_id} because canonical output name {base_stem} was already exported"
                         )
                         interior_conflict_skips += 1
                         continue
-                    else:
-                        interior_named_exports += 1
+                    interior_named_exports += 1
                 elif model.export_kind == "interior_fallback":
                     diagnostics.append(
                         f"{archive_name}: skipped unresolved interior resource from sector={candidate_placements[0].sector_id}, "
