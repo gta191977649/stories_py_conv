@@ -49,6 +49,26 @@ def half_to_float(value: int) -> float:
     return float(np.frombuffer(struct.pack("<H", value), dtype=np.float16)[0])
 
 
+def _ps2_exact_mip_texel_bytes(width: int, height: int, bpp: int, mip_count: int) -> int:
+    total = 0
+    mip_levels = max(1, int(mip_count))
+    w = max(1, int(width))
+    h = max(1, int(height))
+    for _ in range(mip_levels):
+        total += (w * h * int(bpp)) // 8
+        w = max(1, w // 2)
+        h = max(1, h // 2)
+    return total
+
+
+def _ps2_palette_bytes(bpp: int) -> int:
+    if bpp == 4:
+        return 16 * 4
+    if bpp == 8:
+        return 256 * 4
+    return 0
+
+
 @dataclass(slots=True)
 class MDLMaterial:
     texture_id: int
@@ -208,6 +228,7 @@ class LVZArchive:
     def __init__(self, archive_name: str, lvz_path: Path, img_path: Path) -> None:
         self.archive_name = archive_name
         self.level = LevelChunk.from_archive(lvz_path.parent, archive_name)
+        self.master_resource_ptr_by_res_id = self.level.read_master_resource_pointers()
         self.master_raw_by_res_id = self._load_master_resources()
         self.area_raw_by_res_id = self._load_area_resources()
         self.overlay_raw_variants_by_res_id = self._load_sector_overlay_resources()
@@ -217,8 +238,7 @@ class LVZArchive:
         self.known_names = {name.lower(): name for name in self.known_hash_names.values()}
 
     def _load_master_resources(self) -> dict[int, bytes]:
-        pointers = self.level.read_master_resource_pointers()
-        ordered = sorted((ptr, res_id) for res_id, ptr in pointers.items())
+        ordered = sorted((ptr, res_id) for res_id, ptr in self.master_resource_ptr_by_res_id.items())
         boundaries = [ptr for ptr, _res_id in ordered] + [len(self.level.data)]
         resources: dict[int, bytes] = {}
         for index, (ptr, res_id) in enumerate(ordered):
@@ -283,7 +303,7 @@ class LVZArchive:
                 return known_hash_names[hash_value], "hash"
         return f"{self.archive_name.lower()}_{res_id}", "synthetic"
 
-    def _decode_texture_blob(self, blob: bytes, res_id: int) -> tuple[DecodedTexture | None, str]:
+    def _decode_texture_blob(self, blob: bytes, res_id: int, origin: str) -> tuple[DecodedTexture | None, str]:
         if len(blob) < 16:
             return None, "synthetic"
         parsed = parse_ps2_header((b"\x00" * 16) + blob, 16)
@@ -295,7 +315,31 @@ class LVZArchive:
             raster_offset=16,
             flags=parsed.flags,
         )
-        rgba = decode_ps2_texture(blob, header, len(blob) - 16)
+        block_size = max(0, len(blob) - 16)
+
+        local_raster_offset: int | None = None
+        if 0 < parsed.raster_offset < len(blob):
+            local_raster_offset = parsed.raster_offset
+        elif origin == "master":
+            base_ptr = self.master_resource_ptr_by_res_id.get(res_id)
+            if base_ptr is not None:
+                candidate = parsed.raster_offset - base_ptr
+                if 0 < candidate < len(blob):
+                    local_raster_offset = candidate
+
+        if local_raster_offset is not None:
+            exact_block_size = _ps2_exact_mip_texel_bytes(parsed.width, parsed.height, parsed.bpp, parsed.mip_count)
+            exact_block_size += _ps2_palette_bytes(parsed.bpp)
+            if exact_block_size > 0 and local_raster_offset + exact_block_size <= len(blob):
+                header = Ps2TexHeader(
+                    reserved0=parsed.reserved0,
+                    reserved1=parsed.reserved1,
+                    raster_offset=local_raster_offset,
+                    flags=parsed.flags,
+                )
+                block_size = exact_block_size
+
+        rgba = decode_ps2_texture(blob, header, block_size)
         if rgba is None:
             return None, "synthetic"
         texture_name, naming_mode = self._recover_texture_name(blob, res_id)
@@ -311,7 +355,7 @@ class LVZArchive:
             decoded = None
             naming_mode = "synthetic"
             for blob, _origin in self.resource_blobs_for_res_id(res_id):
-                decoded, naming_mode = self._decode_texture_blob(blob, res_id)
+                decoded, naming_mode = self._decode_texture_blob(blob, res_id, _origin)
                 if decoded is not None:
                     break
             self.texture_cache[res_id] = (decoded, naming_mode)
@@ -442,7 +486,10 @@ class LVZArchive:
             return None
         num_meshes = struct.unpack_from("<H", blob, 0)[0]
         header_size = struct.unpack_from("<H", blob, 2)[0]
-        if not (0 < num_meshes <= 64):
+        # Valid streamed interiors can exceed 64 packet descriptors
+        # (e.g. MAINLA/haitin_sh_int uses 66). Keep a sanity cap, but
+        # don't reject larger real-world blobs up front.
+        if not (0 < num_meshes <= 256):
             return None
         desc_size = 24
         desc_end = 4 + (num_meshes * desc_size)
@@ -963,7 +1010,9 @@ def export_streamed_archive(
                     continue
                 base_index = len(vertices)
                 vertices.extend(transformed_vertices)
-                uvs.extend(geometry.uvs)
+                # PS2 UVs are emitted in the same convention as the standard
+                # MDL path, so flip V here before writing the DFF.
+                uvs.extend((u, 1.0 - v) for u, v in geometry.uvs)
                 if geometry.vertex_colors and len(geometry.vertex_colors) == len(geometry.vertices):
                     vertex_colors.extend(geometry.vertex_colors)
                 else:

@@ -550,7 +550,10 @@ def plan_streamed_archive(
                 model_hidden_alternates[model_name] = True
             if is_interior_visit:
                 interior_model_meta.setdefault(model_name, (txd_name, source_file, "interior_named"))
-                cluster_key = (visit.sector_id, instance.res_id, visit.source_kind)
+                # Interior models can be split across several streamed resIds
+                # that share the same sector-local transform. Group those
+                # fragments together so they export as one model.
+                cluster_key = (visit.sector_id, _matrix_signature(absolute_matrix), visit.source_kind)
                 cluster = interior_contributions[model_name][cluster_key]
             else:
                 world_model_meta.setdefault(model_name, (txd_name, source_file))
@@ -570,7 +573,7 @@ def plan_streamed_archive(
         elif is_interior_visit:
             fallback_name = f"interior_{archive_name.lower()}_{visit.sector_id}_{instance.res_id}"
             interior_model_meta.setdefault(fallback_name, ("", f"{archive_name}.LVZ", "interior_fallback"))
-            cluster_key = (visit.sector_id, instance.res_id, visit.source_kind)
+            cluster_key = (visit.sector_id, _matrix_signature(absolute_matrix), visit.source_kind)
             cluster = interior_contributions[fallback_name][cluster_key]
             best = cluster.get(instance.res_id)
             if best is None:

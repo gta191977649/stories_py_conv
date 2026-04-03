@@ -506,10 +506,10 @@ def decode_ps2_texture(
         idx = np.empty(pixel_count, dtype=np.uint8)
         for i in range(pixel_count // 2):
             byte = raw[i]
-            idx[i * 2] = byte & 0x0F
-            idx[i * 2 + 1] = byte >> 4
+            idx[i * 2] = byte >> 4
+            idx[i * 2 + 1] = byte & 0x0F
         if pixel_count % 2:
-            idx[-1] = raw[pixel_count // 2] & 0x0F
+            idx[-1] = raw[pixel_count // 2] >> 4
         if thdr.swizzle_mask & 1:
             idx = unswizzle_ps2_indices(idx, w, h)
     elif bpp == 8:
@@ -550,5 +550,4 @@ def decode_ps2_texture(
 ###############################################################################
 # Main decoding logic for Blender
 ###############################################################################
-
 
