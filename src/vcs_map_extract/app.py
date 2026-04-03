@@ -163,7 +163,7 @@ def _ensure_knackers_txd(output_root: Path) -> None:
 
 
 def _cleanup_stale_generated_outputs(output_root: Path) -> None:
-    for archive_name in STREAMED_ARCHIVES:
+    for archive_name in ARCHIVE_ORDER:
         archive_dir = output_root / archive_name
         for path in archive_dir.glob("*__int_*.*"):
             if path.is_file():
@@ -174,6 +174,9 @@ def _cleanup_stale_generated_outputs(output_root: Path) -> None:
         stale_interior_generic = archive_dir / "interior_generic.txd"
         if stale_interior_generic.exists():
             stale_interior_generic.unlink()
+        stale_knackers = archive_dir / "knackers.txd"
+        if stale_knackers.exists():
+            stale_knackers.unlink()
 
 
 def _clean_output_dir(output_root: Path) -> None:
@@ -243,11 +246,6 @@ def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: 
         for archive_name in ARCHIVE_ORDER:
             safe_mkdir(output_root / archive_name)
         _cleanup_stale_generated_outputs(output_root)
-        for archive_name in STREAMED_ARCHIVES:
-            stale_knackers = output_root / archive_name / "knackers.txd"
-            if stale_knackers.exists():
-                stale_knackers.unlink()
-
         ide_catalog = parse_ide_directory(root / "ide")
         game_dat = None
         game_dat_models = None

@@ -57,12 +57,11 @@ def collect_pack_files(output_root: Path) -> tuple[list[tuple[str, bytes]], list
         key = knackers.name.lower()
         data = knackers.read_bytes()
         if key in packed and packed[key] != data:
-            conflict = f"{key}: kept earlier archive version, skipped root knackers.txd"
+            conflict = f"{key}: replaced earlier archive version with root knackers.txd"
             conflicts.append(conflict)
             _log(f"[buildimg] conflict {conflict}")
-        else:
-            packed[key] = data
-            _log("[buildimg] added root knackers.txd")
+        packed[key] = data
+        _log("[buildimg] added root knackers.txd")
     return sorted(packed.items()), conflicts
 
 
