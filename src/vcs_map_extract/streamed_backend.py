@@ -340,9 +340,9 @@ class LVZArchive:
                 if 0 < candidate < len(blob):
                     local_raster_offset = candidate
 
+        exact_block_size = _ps2_exact_mip_texel_bytes(parsed.width, parsed.height, parsed.bpp, parsed.mip_count)
+        exact_block_size += _ps2_palette_bytes(parsed.bpp)
         if local_raster_offset is not None:
-            exact_block_size = _ps2_exact_mip_texel_bytes(parsed.width, parsed.height, parsed.bpp, parsed.mip_count)
-            exact_block_size += _ps2_palette_bytes(parsed.bpp)
             if exact_block_size > 0 and local_raster_offset + exact_block_size <= len(blob):
                 header = Ps2TexHeader(
                     reserved0=parsed.reserved0,
@@ -351,8 +351,10 @@ class LVZArchive:
                     flags=parsed.flags,
                 )
                 block_size = exact_block_size
+        elif exact_block_size > 0 and 16 + exact_block_size <= len(blob):
+            block_size = exact_block_size
 
-        rgba = decode_ps2_texture(blob, header, block_size)
+        rgba = decode_ps2_texture(blob, header, block_size, four_bit_high_nibble_first=True)
         if rgba is None:
             return None, "synthetic"
         texture_name, naming_mode = self._recover_texture_name(blob, res_id)
@@ -365,12 +367,15 @@ class LVZArchive:
 
     def texture_for_res_id(self, res_id: int) -> tuple[DecodedTexture | None, str]:
         if res_id not in self.texture_cache:
-            decoded = None
+            decoded: DecodedTexture | None = None
             naming_mode = "synthetic"
             for blob, _origin in self.resource_blobs_for_res_id(res_id):
-                decoded, naming_mode = self._decode_texture_blob(blob, res_id, _origin)
-                if decoded is not None:
-                    break
+                candidate, candidate_mode = self._decode_texture_blob(blob, res_id, _origin)
+                if candidate is None:
+                    continue
+                if decoded is None or _texture_quality(candidate) > _texture_quality(decoded):
+                    decoded = candidate
+                    naming_mode = candidate_mode
             self.texture_cache[res_id] = (decoded, naming_mode)
         return self.texture_cache[res_id]
 
@@ -869,9 +874,20 @@ def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarr
 
 
 def merge_texture(existing: DecodedTexture, incoming: DecodedTexture) -> DecodedTexture:
-    if incoming.width * incoming.height > existing.width * existing.height:
+    if _texture_quality(incoming) > _texture_quality(existing):
         return incoming
     return existing
+
+
+def _texture_quality(texture: DecodedTexture) -> tuple[int, int, int]:
+    rgba = np.frombuffer(texture.rgba, dtype=np.uint8)
+    alpha = rgba[3::4]
+    rgb = rgba.reshape((-1, 4))[:, :3]
+    return (
+        texture.width * texture.height,
+        int(np.count_nonzero(alpha)),
+        int(rgb.sum()),
+    )
 
 
 def _geometry_signature(fragment_keys: set[tuple[int, int, int]]) -> str:

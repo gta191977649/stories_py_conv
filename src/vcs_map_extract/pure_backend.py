@@ -76,7 +76,7 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
         return []
 
     visited: set[int] = set()
-    textures: list[tuple[str, object, int]] = []
+    textures: list[tuple[str, object, int, int, int]] = []
     base = tex_mod.slot_base_from_slot_ptr(first_slot)
     last_base = tex_mod.slot_base_from_slot_ptr(last_slot) if last_slot else None
 
@@ -95,7 +95,7 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
             if header_obj is None:
                 header_obj = tex_mod.parse_psp_header(data, tex_off)
             if header_obj is not None:
-                textures.append((name, header_obj, int(header_obj.raster_offset)))
+                textures.append((name, header_obj, int(header_obj.raster_offset), int(base), int(tex_off)))
 
         next_slot = container["next_slot"]
         if next_slot == 0:
@@ -109,20 +109,40 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
         return []
 
     textures.sort(key=lambda item: item[2])
-    offsets = [offset for _name, _header_obj, offset in textures]
+    offsets = [offset for _name, _header_obj, offset, _base, _tex_off in textures]
+    boundaries = {len(data), header["glob1"], header["glob2"], header["coll_size"]}
+    for _name, _header_obj, offset, base, tex_off in textures:
+        boundaries.update({offset, base, tex_off})
     block_sizes: list[int] = []
-    for index, start in enumerate(offsets):
-        if index + 1 < len(offsets):
-            end = offsets[index + 1]
+    for _name, header_obj, start, _base, _tex_off in textures:
+        if isinstance(header_obj, tex_mod.Ps2TexHeader):
+            minimum_size = max(
+                0,
+                ((header_obj.width * header_obj.height * header_obj.bpp) + 7) // 8
+                + (16 * 4 if header_obj.bpp == 4 else 256 * 4 if header_obj.bpp == 8 else 0),
+            )
         else:
-            candidates = [header["glob1"], header["glob2"], header["coll_size"], len(data)]
-            end = min(candidate for candidate in candidates if candidate > start)
+            minimum_size = max(
+                0,
+                ((header_obj.width * header_obj.height * header_obj.bpp) + 7) // 8
+                + (16 * 4 if header_obj.bpp == 4 else 256 * 4 if header_obj.bpp == 8 else 0),
+            )
+        candidates = [candidate for candidate in boundaries if candidate >= start + minimum_size]
+        if not candidates:
+            candidates = [candidate for candidate in boundaries if candidate > start]
+        end = min(candidates) if candidates else len(data)
         block_sizes.append(max(0, end - start))
 
     decoded: list[DecodedTexture] = []
-    for (name, header_obj, _offset), block_size in zip(textures, block_sizes, strict=True):
+    for (name, header_obj, _offset, _base, _tex_off), block_size in zip(textures, block_sizes, strict=True):
         if isinstance(header_obj, tex_mod.Ps2TexHeader):
-            rgba_array = tex_mod.decode_ps2_texture(data, header_obj, block_size, palette_override=None)
+            rgba_array = tex_mod.decode_ps2_texture(
+                data,
+                header_obj,
+                block_size,
+                palette_override=None,
+                four_bit_high_nibble_first=False,
+            )
         else:
             rgba_array = tex_mod.decode_psp_texture(data, header_obj, block_size, palette_override=None)
         if rgba_array is None:
@@ -276,7 +296,13 @@ def write_dff_from_mesh(mesh: MeshData, output_path: Path, frame_name: str) -> N
     normals = _calculate_normals(mesh.vertices, mesh.faces)
     (cx, cy, cz), radius = _calculate_bounds(mesh.vertices)
 
-    material_names = sorted(set(name for name in mesh.face_materials if name))
+    material_names: list[str] = []
+    seen_material_names: set[str] = set()
+    for name in mesh.face_materials:
+        if not name or name in seen_material_names:
+            continue
+        seen_material_names.add(name)
+        material_names.append(name)
     material_slot = {name: index for index, name in enumerate(material_names)}
     materials = []
     for name in material_names:
