@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --decode-dat --export\n"
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out --export\n"
             "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --decode-dat\n"
+            "  vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --dxt-level 3\n"
             "\n"
             "Use --export to extract models. Use --buildimg together with --export to pack OUTPUT/vcs_map.img."
         ),
@@ -46,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Decode GAME.dat into OUTPUT/data/ide and OUTPUT/data/ipl, then exit",
     )
+    parser.add_argument(
+        "--dxt-level",
+        type=int,
+        choices=(1, 2, 3, 4, 5),
+        help="Write exported TXDs using DXT compression level 1-5 instead of uncompressed rasters",
+    )
     return parser
 
 
@@ -56,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--buildimg requires --export. Use: vcs-map-extract INPUT OUTPUT --export --buildimg")
     if not args.clean and not args.decode_dat and not args.export:
         parser.error("No action selected. Use --clean, --export, or --decode-dat.")
-    return run(args.input, args.output, args.clean, args.export, args.buildimg, args.decode_dat)
+    return run(args.input, args.output, args.clean, args.export, args.buildimg, args.decode_dat, args.dxt_level)
 
 
 if __name__ == "__main__":

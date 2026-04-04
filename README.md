@@ -49,7 +49,7 @@ cd /Users/nurupo/Desktop/dev/stories_py_conv
 CLI shape:
 
 ```text
-vcs-map-extract INPUT OUTPUT [--clean] [--export] [--buildimg] [--decode-dat]
+vcs-map-extract INPUT OUTPUT [--clean] [--export] [--buildimg] [--decode-dat] [--dxt-level {1,2,3,4,5}]
 ```
 
 Positional arguments:
@@ -69,10 +69,22 @@ Options:
   - this is the flag that actually performs asset extraction
 - `--buildimg`
   - pack generated `.dff/.txd/.col` outputs into `OUTPUT/vcs_map.img`
+  - also rebuild `OUTPUT/GTA3PS2.img` from the exported `OUTPUT/GTA3PS2/` files
   - requires `--export`
 - `--decode-dat`
   - decode `GAME.dat` into generated IDE/IPL text files under `OUTPUT/data/`
   - can be used by itself or together with `--export`
+- `--dxt-level {1,2,3,4,5}`
+  - write exported `.txd` files using DXT compression instead of uncompressed rasters
+  - applies to standard archive TXDs, streamed archive TXDs, and the final root `knackers.txd`
+  - when omitted, TXDs are written uncompressed as before
+  - mapping:
+    - `1` -> DXT1
+    - `2` -> DXT2
+    - `3` -> DXT3
+    - `4` -> DXT4
+    - `5` -> DXT5
+  - example: `--dxt-level 3` writes DXT3-compressed TXDs
 
 Common command lines:
 
@@ -83,10 +95,13 @@ vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --clean
 # export models/textures/collisions
 vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export
 
+# export TXDs as DXT3
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --dxt-level 3
+
 # clean, then export
 vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --clean --export
 
-# export and build vcs_map.img
+# export and build vcs_map.img plus GTA3PS2.img
 vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --buildimg
 
 # decode GAME.dat only
@@ -103,6 +118,7 @@ Important CLI rules:
 
 - At least one action must be selected: `--clean`, `--export`, or `--decode-dat`.
 - `--buildimg` cannot be used alone; it must be combined with `--export`.
+- `--dxt-level` is only meaningful when `--export` is also used, because TXDs are only written during export.
 
 ## Output
 
@@ -116,6 +132,7 @@ The tool writes:
 - `OUTPUT/knackers.txd`
 - `OUTPUT/report.txt`
 - `OUTPUT/vcs_map.img` when `--buildimg` is used
+- `OUTPUT/GTA3PS2.img` when `--buildimg` is used
 
 ## Streamed Archive Structure
 
@@ -125,9 +142,12 @@ The standard archives are conventional GTA-style IMG archives:
 GTA3PS2.IMG
 MOCAPPS2.IMG
 └── named entries
-    ├── *.mdl
-    ├── *.tex / *.xtx / *.chk
-    └── *.col2
+    ├── *.mdl                  (model)
+    ├── *.tex / *.xtx / *.chk  (texture)
+    ├── *.anim                 (animation)
+    ├── *.cut                  (cutscene definition file)
+    ├── *.cam                  (camera motion file for cutscene)
+    └── *.col2                 (collision file)
 ```
 
 Important: `MOCAPPS2.IMG` is not a pure map archive. It contains non-static assets such as cutscene, animation, and related story resources. This tool does not try to convert those. For `MOCAPPS2.IMG`, the current scope is still only static/map-style resources that can be exported as:

@@ -65,10 +65,34 @@ def collect_pack_files(output_root: Path) -> tuple[list[tuple[str, bytes]], list
     return sorted(packed.items()), conflicts
 
 
-def write_packed_img(output_root: Path) -> tuple[Path, list[str]]:
+def collect_archive_pack_files(output_root: Path, archive_name: str) -> list[tuple[str, bytes]]:
+    archive_dir = output_root / archive_name
+    packed: list[tuple[str, bytes]] = []
+    if not archive_dir.exists():
+        return packed
+    for path in sorted(archive_dir.glob("*")):
+        if path.suffix.lower() not in {".dff", ".txd", ".col"}:
+            continue
+        packed.append((path.name.lower(), path.read_bytes()))
+    _log(f"[buildimg] scan {archive_name}: scanned={len(packed)}, added={len(packed)}, total={len(packed)}")
+    return packed
+
+
+def write_packed_img(output_root: Path) -> tuple[list[Path], list[str]]:
     files, conflicts = collect_pack_files(output_root)
+    output_paths: list[Path] = []
+
     output_path = output_root / "vcs_map.img"
     _log(f"[buildimg] writing {len(files)} files to {output_path}")
     write_ver2_img(output_path, files)
     _log(f"[buildimg] wrote {output_path} ({len(files)} entries, conflicts={len(conflicts)})")
-    return output_path, conflicts
+    output_paths.append(output_path)
+
+    gta3ps2_files = collect_archive_pack_files(output_root, "GTA3PS2")
+    gta3ps2_output_path = output_root / "GTA3PS2.img"
+    _log(f"[buildimg] writing {len(gta3ps2_files)} files to {gta3ps2_output_path}")
+    write_ver2_img(gta3ps2_output_path, gta3ps2_files)
+    _log(f"[buildimg] wrote {gta3ps2_output_path} ({len(gta3ps2_files)} entries)")
+    output_paths.append(gta3ps2_output_path)
+
+    return output_paths, conflicts

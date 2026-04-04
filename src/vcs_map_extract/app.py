@@ -213,7 +213,15 @@ def _progress_phase_count(clean: bool, export: bool, buildimg: bool, decode_dat:
     return max(1, phases)
 
 
-def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: bool, decode_dat: bool = False) -> int:
+def run(
+    input_path: str,
+    output_path: str,
+    clean: bool,
+    export: bool,
+    buildimg: bool,
+    decode_dat: bool = False,
+    dxt_level: int | None = None,
+) -> int:
     root = normalize_input_root(input_path)
     output_root = Path(output_path).expanduser().resolve()
     safe_mkdir(output_root)
@@ -309,6 +317,7 @@ def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: 
             progress.start_phase("Convert Standard Assets", len(standard_jobs), unit="job")
             standard_results = run_conversion_jobs(
                 standard_jobs,
+                dxt_level=dxt_level,
                 log=progress.log,
                 log_success=False,
                 on_job_done=lambda job, result: progress.advance(
@@ -348,6 +357,7 @@ def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: 
                         output_root,
                         plan,
                         report,
+                        dxt_level=dxt_level,
                         global_knackers_textures=global_knackers_textures,
                         ipl_summary=ipl_summary,
                         on_model_done=lambda archive, model, exported: progress.advance(
@@ -364,7 +374,11 @@ def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: 
         progress.finish_phase(summary="Finished streamed model export")
 
         if global_knackers_textures:
-            write_txd_from_decoded_textures(output_root / "knackers.txd", list(global_knackers_textures.values()))
+            write_txd_from_decoded_textures(
+                output_root / "knackers.txd",
+                list(global_knackers_textures.values()),
+                dxt_level=dxt_level,
+            )
         _ensure_knackers_txd(output_root)
 
         report.summary_by_archive = {name: dict(summary[name]) for name in ARCHIVE_ORDER}
@@ -399,12 +413,12 @@ def run(input_path: str, output_path: str, clean: bool, export: bool, buildimg: 
             progress.start_phase("Build IMG", 1, unit="task")
             previous_packimg_sink = set_packimg_log_sink(None)
             try:
-                _packed_path, conflicts = write_packed_img(output_root)
+                packed_paths, conflicts = write_packed_img(output_root)
             finally:
                 set_packimg_log_sink(previous_packimg_sink)
             report.duplicate_pack_conflicts.extend(conflicts)
-            progress.advance(detail="vcs_map.img")
-            progress.finish_phase(summary="Packed vcs_map.img")
+            progress.advance(detail=", ".join(path.name for path in packed_paths))
+            progress.finish_phase(summary=f"Packed {', '.join(path.name for path in packed_paths)}")
 
         progress.start_phase("Write Report", 1, unit="task")
         write_report(output_root / "report.txt", report)

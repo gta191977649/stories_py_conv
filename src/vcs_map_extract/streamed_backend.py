@@ -1312,6 +1312,7 @@ def export_streamed_archive(
     output_root: Path,
     plan: StreamedArchivePlan,
     report: ReportData,
+    dxt_level: int | None = None,
     global_knackers_textures: dict[str, DecodedTexture] | None = None,
     ipl_summary: IplSummary | None = None,
     on_model_done: Callable[[str, StreamedModelPlan, bool], None] | None = None,
@@ -1497,10 +1498,18 @@ def export_streamed_archive(
         if textures:
             if txd_name.lower() == "knackers":
                 continue
-            write_txd_from_decoded_textures(archive_dir / f"{sanitize_filename(txd_name)}.txd", list(textures.values()))
+            write_txd_from_decoded_textures(
+                archive_dir / f"{sanitize_filename(txd_name)}.txd",
+                list(textures.values()),
+                dxt_level=dxt_level,
+            )
 
     if global_knackers_textures is None and knackers_textures:
-        write_txd_from_decoded_textures(output_root / "knackers.txd", list(knackers_textures.values()))
+        write_txd_from_decoded_textures(
+            output_root / "knackers.txd",
+            list(knackers_textures.values()),
+            dxt_level=dxt_level,
+        )
 
     return {
         "exported_models": exported_models,

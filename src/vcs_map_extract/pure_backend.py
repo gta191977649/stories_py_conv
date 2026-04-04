@@ -165,7 +165,198 @@ def _iter_decoded_textures(input_path: Path) -> list[DecodedTexture]:
     return decoded
 
 
-def _make_txd_native(texture: DecodedTexture):
+def _rgb888_to_565(rgb: np.ndarray) -> int:
+    red, green, blue = (int(channel) for channel in rgb[:3])
+    return (
+        (((red * 31) + 127) // 255) << 11
+        | (((green * 63) + 127) // 255) << 5
+        | (((blue * 31) + 127) // 255)
+    )
+
+
+def _rgb565_to_888(color: int) -> np.ndarray:
+    return np.array(
+        [
+            ((color >> 11) & 0x1F) * 255 // 0x1F,
+            ((color >> 5) & 0x3F) * 255 // 0x3F,
+            (color & 0x1F) * 255 // 0x1F,
+        ],
+        dtype=np.uint8,
+    )
+
+
+def _pad_texture_block(rgba: np.ndarray, start_x: int, start_y: int) -> np.ndarray:
+    block = np.empty((4, 4, 4), dtype=np.uint8)
+    max_y = rgba.shape[0] - 1
+    max_x = rgba.shape[1] - 1
+    for block_y in range(4):
+        src_y = min(start_y + block_y, max_y)
+        for block_x in range(4):
+            src_x = min(start_x + block_x, max_x)
+            block[block_y, block_x] = rgba[src_y, src_x]
+    return block
+
+
+def _premultiply_block_rgb(block: np.ndarray) -> np.ndarray:
+    rgb = block[:, :, :3].astype(np.uint16)
+    alpha = block[:, :, 3:4].astype(np.uint16)
+    return (((rgb * alpha) + 127) // 255).astype(np.uint8)
+
+
+def _select_color_endpoints(block_rgb: np.ndarray) -> tuple[int, int]:
+    colors = block_rgb.reshape(-1, 3).astype(np.int16)
+    if np.all(colors == colors[0]):
+        color = _rgb888_to_565(colors[0])
+        return color, color
+
+    mins = colors.min(axis=0)
+    maxs = colors.max(axis=0)
+    axis = maxs - mins
+    if not np.any(axis):
+        axis = np.array([1, 1, 1], dtype=np.int16)
+    projections = colors @ axis
+    endpoint0 = colors[int(np.argmax(projections))]
+    endpoint1 = colors[int(np.argmin(projections))]
+    return _rgb888_to_565(endpoint0), _rgb888_to_565(endpoint1)
+
+
+def _build_color_palette(color0: int, color1: int, *, use_three_color: bool) -> np.ndarray:
+    rgb0 = _rgb565_to_888(color0).astype(np.uint16)
+    rgb1 = _rgb565_to_888(color1).astype(np.uint16)
+    if use_three_color:
+        palette = np.array(
+            [
+                rgb0,
+                rgb1,
+                (rgb0 + rgb1) // 2,
+                np.array([0, 0, 0], dtype=np.uint16),
+            ],
+            dtype=np.uint16,
+        )
+    else:
+        palette = np.array(
+            [
+                rgb0,
+                rgb1,
+                ((2 * rgb0) + rgb1) // 3,
+                (rgb0 + (2 * rgb1)) // 3,
+            ],
+            dtype=np.uint16,
+        )
+    return palette.astype(np.uint8)
+
+
+def _encode_color_block(block_rgb: np.ndarray, *, allow_transparency: bool, alpha: np.ndarray | None = None) -> bytes:
+    color0, color1 = _select_color_endpoints(block_rgb)
+    use_three_color = bool(allow_transparency and alpha is not None and np.any(alpha.reshape(-1) < 128))
+    if use_three_color and color0 > color1:
+        color0, color1 = color1, color0
+    if not use_three_color and color0 < color1:
+        color0, color1 = color1, color0
+
+    palette = _build_color_palette(color0, color1, use_three_color=use_three_color)
+    colors = block_rgb.reshape(-1, 3).astype(np.int16)
+    distances = np.sum((colors[:, None, :] - palette[None, :, :].astype(np.int16)) ** 2, axis=2)
+
+    if use_three_color:
+        indices = np.argmin(distances[:, :3], axis=1).astype(np.uint32)
+        transparent = alpha.reshape(-1) < 128 if alpha is not None else np.zeros(16, dtype=bool)
+        indices[transparent] = 3
+    else:
+        indices = np.argmin(distances, axis=1).astype(np.uint32)
+
+    bits = 0
+    for pixel_index, palette_index in enumerate(indices):
+        bits |= (int(palette_index) & 0x3) << (2 * pixel_index)
+
+    return struct.pack("<HHI", color0, color1, bits)
+
+
+def _encode_dxt3_alpha_block(alpha: np.ndarray) -> bytes:
+    rows = bytearray()
+    for row in alpha.reshape(4, 4):
+        row_bits = 0
+        for pixel_index, value in enumerate(row):
+            row_bits |= (((int(value) * 15) + 127) // 255) << (4 * pixel_index)
+        rows.extend(struct.pack("<H", row_bits))
+    return bytes(rows)
+
+
+def _build_dxt5_alpha_palette(alpha0: int, alpha1: int) -> np.ndarray:
+    if alpha0 > alpha1:
+        values = [
+            alpha0,
+            alpha1,
+            round(alpha0 * (6 / 7) + alpha1 * (1 / 7)),
+            round(alpha0 * (5 / 7) + alpha1 * (2 / 7)),
+            round(alpha0 * (4 / 7) + alpha1 * (3 / 7)),
+            round(alpha0 * (3 / 7) + alpha1 * (4 / 7)),
+            round(alpha0 * (2 / 7) + alpha1 * (5 / 7)),
+            round(alpha0 * (1 / 7) + alpha1 * (6 / 7)),
+        ]
+    else:
+        values = [
+            alpha0,
+            alpha1,
+            round(alpha0 * (4 / 5) + alpha1 * (1 / 5)),
+            round(alpha0 * (3 / 5) + alpha1 * (2 / 5)),
+            round(alpha0 * (2 / 5) + alpha1 * (3 / 5)),
+            round(alpha0 * (1 / 5) + alpha1 * (4 / 5)),
+            0,
+            255,
+        ]
+    return np.array(values, dtype=np.uint8)
+
+
+def _encode_dxt5_alpha_block(alpha: np.ndarray) -> bytes:
+    flat_alpha = alpha.reshape(-1).astype(np.uint8)
+    alpha_min = int(flat_alpha.min())
+    alpha_max = int(flat_alpha.max())
+    if alpha_min == alpha_max:
+        alpha0 = alpha_max
+        alpha1 = alpha_min
+    elif alpha_min == 0 or alpha_max == 255:
+        alpha0 = alpha_min
+        alpha1 = alpha_max
+    else:
+        alpha0 = alpha_max
+        alpha1 = alpha_min
+
+    palette = _build_dxt5_alpha_palette(alpha0, alpha1).astype(np.int16)
+    distances = np.abs(flat_alpha.astype(np.int16)[:, None] - palette[None, :])
+    indices = np.argmin(distances, axis=1)
+
+    alpha_bits = 0
+    for pixel_index, palette_index in enumerate(indices):
+        alpha_bits |= (int(palette_index) & 0x7) << (3 * pixel_index)
+
+    return bytes([alpha0, alpha1]) + alpha_bits.to_bytes(6, byteorder="little")
+
+
+def _encode_dxt_texture(texture: DecodedTexture, dxt_level: int) -> bytes:
+    rgba = np.frombuffer(texture.rgba, dtype=np.uint8).reshape((texture.height, texture.width, 4))
+    encoded = bytearray()
+    for start_y in range(0, texture.height, 4):
+        for start_x in range(0, texture.width, 4):
+            block = _pad_texture_block(rgba, start_x, start_y)
+            alpha = block[:, :, 3]
+
+            if dxt_level == 1:
+                encoded.extend(_encode_color_block(block[:, :, :3], allow_transparency=True, alpha=alpha))
+                continue
+
+            premultiplied_rgb = _premultiply_block_rgb(block) if dxt_level in {2, 4} else block[:, :, :3]
+            if dxt_level in {2, 3}:
+                encoded.extend(_encode_dxt3_alpha_block(alpha))
+                encoded.extend(_encode_color_block(premultiplied_rgb, allow_transparency=False))
+                continue
+
+            encoded.extend(_encode_dxt5_alpha_block(alpha))
+            encoded.extend(_encode_color_block(premultiplied_rgb, allow_transparency=False))
+    return bytes(encoded)
+
+
+def _make_txd_native(texture: DecodedTexture, dxt_level: int | None = None):
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
     rgba = bytes(texture.rgba)
     has_alpha = texture.has_alpha
@@ -186,7 +377,35 @@ def _make_txd_native(texture: DecodedTexture):
         compressed=False,
     )
     native.palette = b""
-    if has_alpha:
+    if dxt_level is not None:
+        format_by_level = {
+            1: dragon_txd.D3DFormat.D3D_DXT1,
+            2: dragon_txd.D3DFormat.D3D_DXT2,
+            3: dragon_txd.D3DFormat.D3D_DXT3,
+            4: dragon_txd.D3DFormat.D3D_DXT4,
+            5: dragon_txd.D3DFormat.D3D_DXT5,
+        }
+        if dxt_level not in format_by_level:
+            raise ValueError(f"Unsupported DXT level: {dxt_level}")
+        native.platform_properties = SimpleNamespace(
+            alpha=has_alpha,
+            cube_texture=False,
+            auto_mipmaps=False,
+            compressed=True,
+        )
+        if dxt_level == 1:
+            native.raster_format_flags = (
+                dragon_txd.RasterFormat.RASTER_1555 << 8
+                if has_alpha
+                else dragon_txd.RasterFormat.RASTER_565 << 8
+            )
+            native.depth = 16
+        else:
+            native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
+            native.depth = 32
+        native.d3d_format = format_by_level[dxt_level]
+        native.pixels = [_encode_dxt_texture(texture, dxt_level)]
+    elif has_alpha:
         native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
         native.d3d_format = dragon_txd.D3DFormat.D3D_8888
         native.depth = 32
@@ -199,18 +418,23 @@ def _make_txd_native(texture: DecodedTexture):
     return native
 
 
-def write_txd_from_decoded_textures(output_path: Path, textures: list[DecodedTexture]) -> list[str]:
+def write_txd_from_decoded_textures(
+    output_path: Path,
+    textures: list[DecodedTexture],
+    *,
+    dxt_level: int | None = None,
+) -> list[str]:
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
     txd_file = dragon_txd.txd()
     txd_file.device_id = dragon_txd.DeviceType.DEVICE_D3D9
-    txd_file.native_textures = [_make_txd_native(texture) for texture in textures]
+    txd_file.native_textures = [_make_txd_native(texture, dxt_level=dxt_level) for texture in textures]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(txd_file.write_memory(RW_VERSION))
     return [texture.name for texture in textures]
 
 
-def write_txd(input_path: Path, output_path: Path) -> list[str]:
-    return write_txd_from_decoded_textures(output_path, _iter_decoded_textures(input_path))
+def write_txd(input_path: Path, output_path: Path, *, dxt_level: int | None = None) -> list[str]:
+    return write_txd_from_decoded_textures(output_path, _iter_decoded_textures(input_path), dxt_level=dxt_level)
 
 
 def _vector_add(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -1305,6 +1529,7 @@ def write_col_from_mesh(mesh: MeshData, output_path: Path, model_id: int = 0) ->
 def run_conversion_jobs(
     jobs: list[dict[str, str]],
     *,
+    dxt_level: int | None = None,
     log: Callable[[str], None] | None = print,
     log_success: bool = True,
     on_job_done: Callable[[dict[str, str], dict[str, object]], None] | None = None,
@@ -1327,7 +1552,7 @@ def run_conversion_jobs(
             if job["type"] == "mdl":
                 write_dff(input_path, output_path)
             elif job["type"] == "tex":
-                result["texture_names"] = write_txd(input_path, output_path)
+                result["texture_names"] = write_txd(input_path, output_path, dxt_level=dxt_level)
             elif job["type"] == "col2":
                 result["models"] = write_col(input_path, output_path)
             elif job["type"] == "raw":
