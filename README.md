@@ -2,6 +2,28 @@
 
 Python CLI for extracting GTA VCS PS2 static/map assets into GTA RW-compatible outputs.
 
+## Helper Tools
+
+The repo also includes a streamed-texture extraction helper for decoder checks:
+
+```bash
+cd /Users/nurupo/Desktop/dev/stories_py_conv
+source .venv/bin/activate
+python txd_extract_test.py /Users/nurupo/Desktop/ps2/GAME MAINLA 5057 --quiet
+```
+
+CLI shape:
+
+```text
+python txd_extract_test.py INPUT_ROOT {BEACH|MAINLA|MALL} RES_ID [-o OUTPUT.png] [--quiet]
+```
+
+Example outputs:
+- default output path: `OUTPUT_DEBUG/mainla_5057.png`
+- custom output path via `-o /path/to/output.png`
+
+Use this tool when you need to verify the current streamed texture decoder against a specific `res_id` without running a full export.
+
 ## Install
 
 ```bash
@@ -78,6 +100,7 @@ Options:
   - write exported `.txd` files using DXT compression instead of uncompressed rasters
   - applies to standard archive TXDs, streamed archive TXDs, and the final root `knackers.txd`
   - when omitted, TXDs are written uncompressed as before
+  - opaque textures still pack as `DXT1/RASTER_565` even when a higher DXT level is requested, matching the current `librw` path
   - mapping:
     - `1` -> DXT1
     - `2` -> DXT2

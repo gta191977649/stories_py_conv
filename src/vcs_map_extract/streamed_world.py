@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import struct
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -30,6 +31,11 @@ SOURCE_PRIORITY = {
     "world": 0,
     "interior": 1,
     "swap-sector": 2,
+}
+RESOURCE_ORIGIN_PRIORITY = {
+    "area": 0,
+    "master": 1,
+    "overlay": 2,
 }
 
 SECTOR_HEADER_STRUCT = struct.Struct("<IIIIIIIHH")
@@ -480,6 +486,96 @@ def parse_area_resource_table(level: LevelChunk, area: AreaInfo) -> dict[int, tu
     return resources
 
 
+def _blob_signature(blob: bytes) -> tuple[int, str]:
+    return (len(blob), hashlib.sha1(blob).hexdigest())
+
+
+def _append_resource_variant(
+    variants_by_res_id: dict[int, list[tuple[str, str, bytes]]],
+    *,
+    res_id: int,
+    origin: str,
+    provenance: str,
+    blob: bytes,
+) -> None:
+    variants = variants_by_res_id.setdefault(res_id, [])
+    signature = _blob_signature(blob)
+    if any(_blob_signature(existing_blob) == signature for _origin, _provenance, existing_blob in variants):
+        return
+    variants.append((origin, provenance, blob))
+
+
+def _load_master_resource_variants(level: LevelChunk) -> dict[int, list[tuple[str, str, bytes]]]:
+    pointers = level.read_master_resource_pointers()
+    ordered = sorted((ptr, res_id) for res_id, ptr in pointers.items())
+    boundaries = [ptr for ptr, _res_id in ordered] + [len(level.data)]
+    resources: dict[int, list[tuple[str, str, bytes]]] = {}
+    for index, (ptr, res_id) in enumerate(ordered):
+        end = boundaries[index + 1]
+        if end > ptr:
+            _append_resource_variant(
+                resources,
+                res_id=res_id,
+                origin="master",
+                provenance="master",
+                blob=level.data[ptr:end],
+            )
+    return resources
+
+
+def _load_planner_resource_variants(level: LevelChunk) -> dict[int, list[tuple[str, str, bytes]]]:
+    resources: dict[int, list[tuple[str, str, bytes]]] = {}
+
+    for res_id, variants in _load_master_resource_variants(level).items():
+        for origin, provenance, blob in variants:
+            _append_resource_variant(resources, res_id=res_id, origin=origin, provenance=provenance, blob=blob)
+
+    for area_index, area in enumerate(level.areas):
+        for res_id, (_raw_address, blob) in parse_area_resource_table(level, area).items():
+            _append_resource_variant(
+                resources,
+                res_id=res_id,
+                origin="area",
+                provenance=f"area[{area_index}]",
+                blob=blob,
+            )
+
+    for sector_id in sorted(level.iter_reachable_sectors()):
+        sector = level.parse_sector(sector_id)
+        for res_id, (_raw_address, blob) in sector.resources.items():
+            _append_resource_variant(
+                resources,
+                res_id=res_id,
+                origin="overlay",
+                provenance=f"sector[{sector_id}]",
+                blob=blob,
+            )
+
+    for variants in resources.values():
+        variants.sort(
+            key=lambda item: (
+                RESOURCE_ORIGIN_PRIORITY.get(item[0], 99),
+                -len(item[2]),
+                item[1],
+            )
+        )
+    return resources
+
+
+def _recover_model_name_from_variants(
+    resolver: NameResolver,
+    variants: list[tuple[str, str, bytes]],
+) -> str | None:
+    recover_name = getattr(resolver, "recover_name_from_blob", None)
+    if recover_name is None:
+        return None
+    for _origin, _provenance, blob in variants:
+        recovered = recover_name(blob)
+        if recovered is not None:
+            return recovered
+    return None
+
+
 def plan_streamed_archive(
     root: Path,
     archive_name: str,
@@ -510,6 +606,9 @@ def plan_streamed_archive(
     area_resource_count = 0
     for area in level.areas:
         area_resource_count += len(parse_area_resource_table(level, area))
+    planner_variants_by_res_id: dict[int, list[tuple[str, str, bytes]]] | None = None
+    recovered_names_by_res_id: dict[int, str | None] = {}
+    is_hash_placeholder = getattr(resolver, "is_hash_placeholder", lambda _name: False)
 
     for visit, pass_index, instance in level.iter_instances():
         total_rows += 1
@@ -528,6 +627,17 @@ def plan_streamed_archive(
             linked_ipl_id = link[0] if link is not None else None
             txd_name = ""
             source_file = f"{archive_name}.LVZ"
+        if model_name is None or is_hash_placeholder(model_name):
+            if instance.res_id not in recovered_names_by_res_id:
+                if planner_variants_by_res_id is None:
+                    planner_variants_by_res_id = _load_planner_resource_variants(level)
+                recovered_names_by_res_id[instance.res_id] = _recover_model_name_from_variants(
+                    resolver,
+                    planner_variants_by_res_id.get(instance.res_id, []),
+                )
+            recovered_name = recovered_names_by_res_id[instance.res_id]
+            if recovered_name is not None:
+                model_name = recovered_name
         if model_name is None and not is_interior_visit:
             no_link_rows += 1
             if instance.world_id not in unresolved_ids and len(unresolved_ids) < MAX_REPORTED_UNRESOLVED:
@@ -583,7 +693,7 @@ def plan_streamed_archive(
                     placement.placement_count = best.placement_count
                     cluster[instance.res_id] = placement
         elif is_interior_visit:
-            fallback_name = f"interior_{archive_name.lower()}_{visit.sector_id}_{instance.res_id}"
+            fallback_name = f"unresolved_{archive_name.lower()}_{visit.sector_id}_{instance.res_id}"
             interior_model_meta.setdefault(fallback_name, ("", f"{archive_name}.LVZ", "interior_fallback"))
             cluster_key = (visit.sector_id, _matrix_signature(absolute_matrix), visit.source_kind)
             cluster = interior_contributions[fallback_name][cluster_key]

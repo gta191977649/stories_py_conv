@@ -2,6 +2,7 @@
 
 Read in this order:
 - [`/doc/overview.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/overview.md)
+- [`/doc/tasks/README.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/README.md)
 - [`/doc/architecture/pipeline.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/architecture/pipeline.md)
 - [`/doc/domain/transform_model.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/domain/transform_model.md)
 - [`/doc/domain/resource_resolution.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/domain/resource_resolution.md)
@@ -32,14 +33,18 @@ Common failure modes:
 - Standard-IMG assumptions on streamed archives: expecting one named model file per model.
 
 Use these docs by task:
-- Transform bug: [`/doc/playbooks/fix_transform_bug.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/fix_transform_bug.md)
-- Decoder work: [`/doc/playbooks/add_decoder.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/add_decoder.md)
-- Missing model: [`/doc/playbooks/debug_missing_model.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/debug_missing_model.md)
-- CLI changes: [`/doc/playbooks/add_cli_flag.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/add_cli_flag.md)
-
-* Pleases update the cosponed task document when fixed.
+- Task documentation rules:
+- For any non-trivial bug, feature, refactor, or research task, find or create a matching task file under [`/doc/tasks/`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/README.md).
+- Use the exact task format from [`/doc/tasks/T000_task_template.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T000_task_template.md).
+- Update the corresponding task file in the same change that advances the work.
+- Keep `Status`, `Plan`, `Verification`, `Last Run Result`, and `Next Action` current.
+- When a task is finished, mark it `completed` and record the final verification details.
+- Do not leave undocumented multi-file work behind for the next agent.
 
 
 Toools:
 * python local env : project_dir/.venv
 * librw (renderware source if you need reference to rw implmentation): /Users/nurupo/Desktop/dev/librwgta-master
+* streamed texture dump helper: /Users/nurupo/Desktop/dev/stories_py_conv/txd_extract_test.py
+  * usage: `python txd_extract_test.py INPUT_ROOT {BEACH|MAINLA|MALL} RES_ID [-o OUTPUT.png] [--quiet]`
+  * use this first for streamed texture decoder checks instead of ad hoc one-off snippets

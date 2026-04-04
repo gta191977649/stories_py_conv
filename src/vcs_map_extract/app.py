@@ -15,8 +15,9 @@ from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import set_log_sink as set_packimg_log_sink, write_packed_img
 from .progress import ProgressDisplay
+from .reference_data import load_vcs_name_table
 from .report import write_report
-from .utils import normalize_input_root, safe_mkdir, sanitize_filename
+from .utils import model_stem_key, normalize_input_root, safe_mkdir, sanitize_filename
 
 if TYPE_CHECKING:
     from .pure_backend import DecodedTexture
@@ -184,6 +185,9 @@ def _cleanup_stale_generated_outputs(output_root: Path) -> None:
         for path in archive_dir.glob("interior_*.*"):
             if path.is_file():
                 path.unlink()
+        for path in archive_dir.glob("unresolved_*.*"):
+            if path.is_file():
+                path.unlink()
         stale_interior_generic = archive_dir / "interior_generic.txd"
         if stale_interior_generic.exists():
             stale_interior_generic.unlink()
@@ -201,6 +205,63 @@ def _clean_output_dir(output_root: Path) -> None:
             shutil.rmtree(child)
         else:
             child.unlink()
+
+
+def _compute_vcsnames_coverage(
+    *,
+    ide_catalog: dict,
+    resolver: NameResolver,
+    game_dat_models: dict[int, object] | None,
+    streamed_plans: list[StreamedArchivePlan],
+    exported_stems_by_archive: dict[str, set[str]],
+) -> tuple[dict[str, int], list[str], list[str]]:
+    reference_names_by_key: dict[str, str] = {}
+    for name in load_vcs_name_table().values():
+        reference_names_by_key.setdefault(model_stem_key(name), name)
+
+    geometry_reference_keys: set[str] = set()
+    for model in ide_catalog.values():
+        geometry_reference_keys.add(model_stem_key(resolver.canonical_model_name(model.model_id, model.model_name)))
+    if game_dat_models is not None:
+        for model in game_dat_models.values():
+            if not getattr(model, "is_map_model", False):
+                continue
+            model_name = getattr(model, "model_name", "")
+            if model_name:
+                geometry_reference_keys.add(model_stem_key(model_name))
+    for plan in streamed_plans:
+        for model in plan.model_exports:
+            if model.unresolved_name:
+                continue
+            geometry_reference_keys.add(model_stem_key(model.model_name))
+
+    exported_stem_keys = {
+        stem.lower()
+        for stems in exported_stems_by_archive.values()
+        for stem in stems
+    }
+
+    geometry_reference_keys &= set(reference_names_by_key)
+    missing_geometry = sorted(
+        reference_names_by_key[key]
+        for key in geometry_reference_keys
+        if key not in exported_stem_keys
+    )
+    non_geometry = sorted(
+        name
+        for key, name in reference_names_by_key.items()
+        if key not in geometry_reference_keys
+    )
+    coverage = {
+        "exported_geometry_names": len(
+            [key for key in geometry_reference_keys if key in exported_stem_keys]
+        ),
+        "geometry_reference_names": len(geometry_reference_keys),
+        "missing_geometry_names": len(missing_geometry),
+        "non_geometry_reference_names": len(non_geometry),
+        "reference_names_total": len(reference_names_by_key),
+    }
+    return coverage, missing_geometry, non_geometry
 
 
 def _progress_phase_count(clean: bool, export: bool, buildimg: bool, decode_dat: bool) -> int:
@@ -393,7 +454,7 @@ def run(
             resolver.canonical_model_name(model.model_id, model.model_name)
             for model in ide_catalog.values()
             if not any(
-                sanitize_filename(resolver.canonical_model_name(model.model_id, model.model_name)) == stem
+                model_stem_key(resolver.canonical_model_name(model.model_id, model.model_name)) == stem.lower()
                 for archive in ARCHIVE_ORDER
                 for stem in exported_stems_by_archive[archive]
             )
@@ -408,6 +469,17 @@ def run(
             source_file: sorted(names)
             for source_file, names in sorted(missing_by_source_file.items())
         }
+        (
+            report.vcsnames_coverage,
+            report.missing_geometry_vcsnames,
+            report.non_geometry_vcsnames,
+        ) = _compute_vcsnames_coverage(
+            ide_catalog=ide_catalog,
+            resolver=resolver,
+            game_dat_models=game_dat_models,
+            streamed_plans=streamed_plans,
+            exported_stems_by_archive=exported_stems_by_archive,
+        )
 
         if buildimg:
             progress.start_phase("Build IMG", 1, unit="task")

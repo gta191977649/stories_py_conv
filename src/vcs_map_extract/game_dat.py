@@ -9,7 +9,7 @@ from collections import defaultdict
 from .ipl_parser import IplSummary, IplTransform
 from .reference_data import load_streamed_link_table, load_vcs_name_table
 from .streamed_world import LEVEL_IDS, LevelChunk, SOURCE_PRIORITY
-from .utils import safe_mkdir
+from .utils import format_hash_name, safe_mkdir
 
 
 GTAG_HEADER_STRUCT = struct.Struct("<7I2H")
@@ -184,7 +184,7 @@ class GameDat:
             hash_key = self._u32(ptr + 8)
             model_type = self._u8(ptr + 16)
             txd_slot = self._s16(ptr + 30)
-            model_name = self.names.get(hash_key, f"hash_{hash_key:08X}")
+            model_name = self.names.get(hash_key, format_hash_name(hash_key))
             model = GameDatModelInfo(
                 model_id=model_id,
                 hash_key=hash_key,

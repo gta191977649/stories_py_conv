@@ -20,9 +20,11 @@ Link chain:
 Rules:
 - Prefer canonical model names over synthetic names when the resolver can prove the link.
 - Keep hashed fallback names as stable identifiers when no canonical name exists.
+- Format hashed fallbacks as lowercase `hash_<8hex>`.
 - Do not invent new names for unresolved streamed models.
 - Do not break `knackers` texture grouping by renaming streamed models inconsistently.
 
 Interior fallback naming:
-- When no linked world model is resolved, current code uses archive/sector/res-id based fallback names.
-- Those fallback names are operational, not semantic truth.
+- When no linked world model is resolved, the planner first tries streamed resource/blob name recovery.
+- If a recoverable semantic or hash name is found, the exporter uses that name instead of an `interior_*` synthetic fallback.
+- If no recoverable name exists, the unresolved plan remains diagnostic-only and is not treated as semantic truth.

@@ -7,6 +7,7 @@ Export run should produce:
 - `.txd` buckets for decoded textures
 - root `knackers.txd` when shared textures are collected
 - `report.txt`
+- `report.txt` includes `vcsnames.ini` coverage counts plus separate geometry-missing and non-geometry/reference-only sections
 
 Decode-dat run should produce:
 - `output/data/maps/*.ide`
@@ -21,4 +22,5 @@ Expected quality properties:
 Expected non-properties:
 - not every IMG entry converts into a RW asset
 - unresolved streamed names can remain hashed
+- unrecoverable streamed interiors do not need archive/sector/res synthetic export names
 - corrupt fragments may be dropped to salvage a model

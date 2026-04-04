@@ -4,6 +4,8 @@ import re
 import zlib
 from pathlib import Path
 
+HASH_NAME_RE = re.compile(r"^hash_([0-9A-Fa-f]{8})$")
+
 
 def _recover_common_absolute_path_typos(path: str | Path) -> Path | None:
     raw = str(path).strip()
@@ -55,6 +57,24 @@ def uppercase_crc32(name: str) -> int:
     return zlib.crc32(name.upper().encode("ascii", "ignore")) & 0xFFFFFFFF
 
 
+def format_hash_name(hash_value: int) -> str:
+    return f"hash_{hash_value & 0xFFFFFFFF:08x}"
+
+
+def parse_hash_name(name: str) -> int | None:
+    match = HASH_NAME_RE.match(name.strip())
+    if match is None:
+        return None
+    return int(match.group(1), 16)
+
+
+def normalize_model_name(name: str) -> str:
+    hash_value = parse_hash_name(name)
+    if hash_value is None:
+        return name
+    return format_hash_name(hash_value)
+
+
 def is_zlib_blob(data: bytes) -> bool:
     return len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x9C, 0xDA)
 
@@ -78,3 +98,7 @@ def maybe_decompress(data: bytes) -> bytes:
 def sanitize_filename(stem: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
     return sanitized or "unnamed"
+
+
+def model_stem_key(name: str) -> str:
+    return sanitize_filename(normalize_model_name(name)).lower()

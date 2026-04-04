@@ -44,6 +44,9 @@ class ReportData:
     ipl_diagnostics: list[str] = field(default_factory=list)
     missing_models: list[str] = field(default_factory=list)
     missing_models_by_source_file: dict[str, list[str]] = field(default_factory=dict)
+    vcsnames_coverage: dict[str, int] = field(default_factory=dict)
+    missing_geometry_vcsnames: list[str] = field(default_factory=list)
+    non_geometry_vcsnames: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

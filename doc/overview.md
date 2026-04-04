@@ -7,6 +7,7 @@ Purpose:
 
 Primary entry points:
 - CLI: [`src/vcs_map_extract/cli.py`](/Users/nurupo/Desktop/dev/stories_py_conv/src/vcs_map_extract/cli.py)
+- Streamed texture debug helper: [`txd_extract_test.py`](/Users/nurupo/Desktop/dev/stories_py_conv/txd_extract_test.py)
 - App orchestration: [`src/vcs_map_extract/app.py`](/Users/nurupo/Desktop/dev/stories_py_conv/src/vcs_map_extract/app.py)
 - Standard archive conversion: [`src/vcs_map_extract/pure_backend.py`](/Users/nurupo/Desktop/dev/stories_py_conv/src/vcs_map_extract/pure_backend.py)
 - Streamed archive planning: [`src/vcs_map_extract/streamed_world.py`](/Users/nurupo/Desktop/dev/stories_py_conv/src/vcs_map_extract/streamed_world.py)
@@ -27,6 +28,13 @@ Non-negotiable facts:
 - Streamed export is anchor-driven, not raw-placement-driven.
 - Resource resolution is multi-source and variant-aware.
 - A visible model can require multiple fragments from multiple resource blobs.
+
+Useful debug tool:
+- Use [`txd_extract_test.py`](/Users/nurupo/Desktop/dev/stories_py_conv/txd_extract_test.py) to dump one streamed texture by archive and `res_id` into `OUTPUT_DEBUG/` without running a full export.
+
+Task tracking:
+- Non-trivial work is tracked under [`/doc/tasks/README.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/README.md).
+- Agents should create or update the corresponding task file whenever they advance a bug, feature, refactor, or research item.
 
 Read next:
 - [`/doc/architecture/pipeline.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/architecture/pipeline.md)

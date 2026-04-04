@@ -218,23 +218,23 @@ class Ps2TexHeader:
 
     @property
     def swizzle_mask(self) -> int:
-        return self.flags & 0xFF
+        return (self.flags >> 24) & 0xFF
 
     @property
     def mip_count(self) -> int:
-        return (self.flags >> 8) & 0xF
+        return (self.flags >> 20) & 0xF
 
     @property
     def bpp(self) -> int:
-        return (self.flags >> 14) & 0x3F
+        return (self.flags >> 12) & 0x3F
 
     @property
     def width_pow2(self) -> int:
-        return (self.flags >> 20) & 0x3F
+        return self.flags & 0x3F
 
     @property
     def height_pow2(self) -> int:
-        return (self.flags >> 26) & 0x3F
+        return (self.flags >> 6) & 0x3F
 
     @property
     def width(self) -> int:
@@ -291,43 +291,52 @@ def parse_ps2_header(data: bytes, offset: int) -> Optional[Ps2TexHeader]:
     reserved0 = read_u32(hdr, 0)
     reserved1 = read_u32(hdr, 4)
     raster_offset = read_u32(hdr, 8)
-    flags = read_u32(hdr, 12)
-    w_pow2_std = (flags >> 20) & 0x3F
-    h_pow2_std = (flags >> 26) & 0x3F
-    bpp_std = (flags >> 14) & 0x3F
-    width_std = 1 << w_pow2_std if w_pow2_std < 32 else 0
-    height_std = 1 << h_pow2_std if h_pow2_std < 32 else 0
-    use_alt = False
-    h_pow2_alt = flags & 0x3F
-    w_pow2_alt = (flags >> 6) & 0x3F
-    bpp_alt = (flags >> 12) & 0x3F
-    alt_unknown = (flags >> 18) & 0x3
-    mip_alt = (flags >> 20) & 0xF
-    swizzle_alt = (flags >> 24) & 0xFF
-    width_alt = 1 << w_pow2_alt if w_pow2_alt < 32 else 0
-    height_alt = 1 << h_pow2_alt if h_pow2_alt < 32 else 0
-    std_invalid = (width_std == 0 or height_std == 0 or width_std > 4096 or height_std > 4096)
-    alt_valid_dims = (width_alt > 0 and height_alt > 0 and width_alt <= 4096 and height_alt <= 4096)
-    alt_bpp_reasonable = bpp_alt in (4, 8, 16, 32)
-    if (
-        std_invalid or
-        (width_std <= 8 and height_std <= 8) or
-        (bpp_std not in (4, 8, 16, 32))
-    ) and alt_valid_dims and alt_bpp_reasonable:
-        use_alt = True
-    if use_alt:
-        canonical_flags = (
-            (swizzle_alt & 0xFF)
-            | ((mip_alt & 0xF) << 8)
-            | ((alt_unknown & 0x3) << 12)
-            | ((bpp_alt & 0x3F) << 14)
-            | ((w_pow2_alt & 0x3F) << 20)
-            | ((h_pow2_alt & 0x3F) << 26)
+    raw_flags = read_u32(hdr, 12)
+
+    def decode_librw_flags(flags: int) -> tuple[int, int, int, int, int]:
+        return (
+            flags & 0x3F,
+            (flags >> 6) & 0x3F,
+            (flags >> 12) & 0x3F,
+            (flags >> 20) & 0xF,
+            (flags >> 24) & 0xFF,
         )
-        flags = canonical_flags
-        width_std = width_alt
-        height_std = height_alt
-    if width_std == 0 or height_std == 0 or width_std > 4096 or height_std > 4096:
+
+    def decode_legacy_flags(flags: int) -> tuple[int, int, int, int, int]:
+        return (
+            (flags >> 20) & 0x3F,
+            (flags >> 26) & 0x3F,
+            (flags >> 14) & 0x3F,
+            (flags >> 8) & 0xF,
+            flags & 0xFF,
+        )
+
+    def flags_are_valid(logw: int, logh: int, bpp: int) -> bool:
+        width = 1 << logw if logw < 32 else 0
+        height = 1 << logh if logh < 32 else 0
+        return width > 0 and height > 0 and width <= 4096 and height <= 4096 and bpp in (4, 8, 16, 32)
+
+    def canonicalize_flags(logw: int, logh: int, bpp: int, mip: int, swizzle: int) -> int:
+        return (
+            (logw & 0x3F)
+            | ((logh & 0x3F) << 6)
+            | ((bpp & 0x3F) << 12)
+            | ((mip & 0xF) << 20)
+            | ((swizzle & 0xFF) << 24)
+        )
+
+    logw, logh, bpp, mip, swizzle = decode_librw_flags(raw_flags)
+    if flags_are_valid(logw, logh, bpp):
+        flags = raw_flags
+    else:
+        logw, logh, bpp, mip, swizzle = decode_legacy_flags(raw_flags)
+        if not flags_are_valid(logw, logh, bpp):
+            return None
+        flags = canonicalize_flags(logw, logh, bpp, mip, swizzle)
+
+    width = 1 << logw if logw < 32 else 0
+    height = 1 << logh if logh < 32 else 0
+    if width == 0 or height == 0 or width > 4096 or height > 4096:
         return None
     return Ps2TexHeader(
         reserved0=reserved0,
@@ -533,7 +542,10 @@ def decode_ps2_texture(
             unswizzled = unswizzle_psp_32bit(raw, w, h)
         else:
             unswizzled = raw
-        rgba = np.frombuffer(unswizzled, dtype=np.uint8).reshape((h, w, 4))
+        rgba_flat = np.frombuffer(unswizzled, dtype=np.uint8)
+        if rgba_flat.size != pixel_count * 4:
+            return None
+        rgba = rgba_flat.reshape((h, w, 4)).copy()
         alpha = rgba[:, :, 3].astype(np.int32) * 255 // 128
         alpha = np.clip(alpha, 0, 255).astype(np.uint8)
         rgba[:, :, 3] = alpha
