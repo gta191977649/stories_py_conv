@@ -547,9 +547,47 @@ def _invert_matrix4(matrix: object) -> tuple[tuple[float, float, float, float], 
     return _matrix_to_rw_matrix(np.linalg.inv(array))
 
 
+def _convert_mdl_frame_matrix_to_rw(matrix: object) -> np.ndarray:
+    array = np.asarray(tuple(tuple(float(value) for value in row) for row in matrix), dtype=np.float64)
+    converted = np.array(array, copy=True)
+    converted[:3, :3] = array[:3, :3].T
+    return converted
+
+
+def _build_rw_frame_world_matrices(armature) -> dict[int, np.ndarray]:
+    local_matrices = {
+        int(ptr): _convert_mdl_frame_matrix_to_rw(matrix)
+        for ptr, matrix in getattr(armature, "frame_mats_local", {}).items()
+    }
+    if not local_matrices:
+        return {}
+
+    parent_ptrs = {
+        int(ptr): int(parent_ptr)
+        for ptr, parent_ptr in getattr(armature, "frame_parent_ptrs", {}).items()
+    }
+    world_matrices: dict[int, np.ndarray] = {}
+
+    def _resolve(ptr: int) -> np.ndarray:
+        if ptr in world_matrices:
+            return world_matrices[ptr]
+        local = local_matrices[ptr]
+        parent_ptr = parent_ptrs.get(ptr, 0)
+        if parent_ptr and parent_ptr in local_matrices:
+            world = _resolve(parent_ptr) @ local
+        else:
+            world = local
+        world_matrices[ptr] = world
+        return world
+
+    for ptr in local_matrices:
+        _resolve(ptr)
+    return world_matrices
+
+
 def _matrix_to_frame_components(matrix: object):
     dragon_dff, _dragon_txd, _dragon_col = load_dragonff_modules()
-    rows = tuple(tuple(float(value) for value in row) for row in matrix)
+    rows = tuple(tuple(float(value) for value in row) for row in _convert_mdl_frame_matrix_to_rw(matrix))
     return (
         dragon_dff.Matrix(
             dragon_dff.Vector(rows[0][0], rows[1][0], rows[2][0]),
@@ -952,20 +990,16 @@ def _ped_bone_records(ctx, mdl_mod) -> list[tuple[int, int, int, str, int]]:
 def _skin_inverse_matrices(ctx, bone_records: list[tuple[int, int, int, str, int]]) -> list[tuple[tuple[float, float, float, float], ...]]:
     armature = ctx.atomic.armature
     geometry_ptr = getattr(ctx.atomic, "frame_ptr", 0)
-    geometry_world = armature.frame_mats_world.get(geometry_ptr)
-    if geometry_world is None:
-        geometry_world = next(iter(getattr(armature, "frame_mats_world", {}).values()), np.identity(4))
-    geometry_world_array = np.asarray(
-        tuple(tuple(float(value) for value in row) for row in geometry_world),
-        dtype=np.float64,
-    )
+    rw_world_matrices = _build_rw_frame_world_matrices(armature)
+    geometry_world_array = rw_world_matrices.get(geometry_ptr)
+    if geometry_world_array is None:
+        geometry_world_array = next(iter(rw_world_matrices.values()), np.identity(4, dtype=np.float64))
 
     inverse_matrices: list[tuple[tuple[float, float, float, float], ...]] = []
     for _bone_id, _index, _type, _name, ptr in bone_records:
-        bone_world = np.asarray(
-            tuple(tuple(float(value) for value in row) for row in armature.frame_mats_world[ptr]),
-            dtype=np.float64,
-        )
+        bone_world = rw_world_matrices.get(ptr)
+        if bone_world is None:
+            continue
         inverse_matrices.append(_matrix_to_rw_matrix(np.linalg.inv(bone_world) @ geometry_world_array))
     return inverse_matrices
 

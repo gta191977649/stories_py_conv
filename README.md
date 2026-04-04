@@ -553,8 +553,6 @@ This prevents one corrupt streamed fragment from causing the whole model export 
 
 
 # Issues (TODO)
-
-* No Vertex color is ripped on model.
 * Incorrect TOBJ
 * Some interior/swap resources still need better classification and dedupe rules.
 * More documentation is still needed for malformed swap-sector placements and non-geometry resource classes.
