@@ -601,19 +601,15 @@ def matrix_inverse(values: tuple[float, ...]) -> np.ndarray:
     return np.linalg.inv(rw_matrix(values))
 
 
-def transform_point(matrix: np.ndarray, point: tuple[float, float, float]) -> tuple[float, float, float]:
-    vector = np.array([point[0], point[1], point[2], 1.0], dtype=np.float64)
-    out = matrix @ vector
-    return (float(out[0]), float(out[1]), float(out[2]))
-
-
-def translation_inverse(values: tuple[float, ...]) -> np.ndarray:
-    matrix = np.identity(4, dtype=np.float64)
-    world = rw_matrix(values)
-    matrix[0, 3] = -world[0, 3]
-    matrix[1, 3] = -world[1, 3]
-    matrix[2, 3] = -world[2, 3]
-    return matrix
+def transform_points(matrix: np.ndarray, points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    arr = np.empty((len(points), 4), dtype=np.float64)
+    for i, (x, y, z) in enumerate(points):
+        arr[i, 0] = x
+        arr[i, 1] = y
+        arr[i, 2] = z
+        arr[i, 3] = 1.0
+    out = arr @ matrix.T
+    return [(float(row[0]), float(row[1]), float(row[2])) for row in out]
 
 
 def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarray, StreamedPlacement | None]:
@@ -629,7 +625,7 @@ def choose_base_transform(placements: list[StreamedPlacement]) -> tuple[np.ndarr
             continue
         if score > best_score:
             best_score = score
-            best_transform = translation_inverse(placement.matrix)
+            best_transform = matrix_inverse(placement.matrix)
             best_placement = placement
     if best_transform is not None:
         return best_transform, best_placement
@@ -728,7 +724,7 @@ def export_streamed_archive(
                     continue
                 seen_fragments.add(fragment_key)
                 local_matrix = base_inverse @ rw_matrix(placement.matrix)
-                transformed_vertices = [transform_point(local_matrix, vertex) for vertex in geometry.vertices]
+                transformed_vertices = transform_points(local_matrix, geometry.vertices)
                 if not _fragment_vertices_valid(transformed_vertices):
                     skipped_bad_fragments += 1
                     bad_fragments_for_model += 1
