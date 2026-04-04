@@ -15,6 +15,8 @@ Procedure:
    - position scaling
    - UV scaling
    - color/prelight extraction
+   - texture payload start and size
+   - palette alpha mapping
 6. Add tests for:
    - successful decode
    - failure behavior
@@ -25,7 +27,10 @@ Validation:
 - decoded geometry or texture is deterministic
 - existing decode paths still pass
 - streamed exports still respect resource variant selection
+- streamed texture decode keeps the raw resource pointer when the header encodes a local raster offset
+- streamed palette reads stop at the minimal raster block, not the end of an oversized resource blob
 
 Do not:
 - replace an existing decoder path with a broader heuristic unless regression coverage proves parity
 - key caches too coarsely
+- assume a streamed texture blob is only `header + texels + palette` when the source format can append unrelated data after the raster block

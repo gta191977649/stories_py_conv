@@ -118,6 +118,7 @@ class ResourceBlobVariant:
     origin: str
     provenance: str
     blob: bytes
+    raw_address: int | None = None
 
 
 @dataclass(slots=True)
@@ -394,6 +395,7 @@ class LVZArchive:
         origin: str,
         provenance: str,
         blob: bytes,
+        raw_address: int | None = None,
     ) -> None:
         variants = variants_by_res_id.setdefault(res_id, [])
         signature = _blob_signature(blob)
@@ -405,6 +407,7 @@ class LVZArchive:
                 origin=origin,
                 provenance=provenance,
                 blob=blob,
+                raw_address=raw_address,
             )
         )
 
@@ -422,6 +425,7 @@ class LVZArchive:
                     origin="master",
                     provenance="master",
                     blob=self.level.data[ptr:end],
+                    raw_address=ptr,
                 )
         return resources
 
@@ -429,13 +433,14 @@ class LVZArchive:
         resources: dict[int, list[ResourceBlobVariant]] = {}
         for area_index, area in enumerate(self.level.areas):
             _log(f"[streamed] {self.archive_name} area {area_index + 1}/{len(self.level.areas)}")
-            for res_id, blob in parse_area_resource_table(self.level, area).items():
+            for res_id, (raw_address, blob) in parse_area_resource_table(self.level, area).items():
                 self._append_unique_variant(
                     resources,
                     res_id=res_id,
                     origin="area",
                     provenance=f"area[{area_index}]",
                     blob=blob,
+                    raw_address=raw_address,
                 )
         return resources
 
@@ -444,13 +449,14 @@ class LVZArchive:
         reachable = self.level.iter_reachable_sectors()
         for sector_id in sorted(reachable):
             sector = self.level.parse_sector(sector_id)
-            for res_id, blob in sector.resources.items():
+            for res_id, (raw_address, blob) in sector.resources.items():
                 self._append_unique_variant(
                     resources,
                     res_id=res_id,
                     origin="overlay",
                     provenance=f"sector[{sector_id}]",
                     blob=blob,
+                    raw_address=raw_address,
                 )
         for variants in resources.values():
             variants.sort(key=lambda variant: len(variant.blob), reverse=True)
@@ -490,19 +496,36 @@ class LVZArchive:
                 return hash_name, "hash"
         return f"{self.archive_name.lower()}_{res_id}", "synthetic"
 
-    def _decode_texture_blob(self, blob: bytes, res_id: int, origin: str) -> tuple[DecodedTexture | None, str]:
+    def _decode_texture_blob(
+        self,
+        blob: bytes,
+        res_id: int,
+        origin: str,
+        *,
+        raw_address: int | None = None,
+    ) -> tuple[DecodedTexture | None, str]:
         if len(blob) < 16:
             return None, "synthetic"
         parsed = parse_ps2_header((b"\x00" * 16) + blob, 16)
         if parsed is None:
             return None, "synthetic"
+        raster_offset = 16
+        if raw_address is not None:
+            candidate_offset = parsed.raster_offset - raw_address
+            if 0 < candidate_offset < len(blob):
+                raster_offset = int(candidate_offset)
         header = Ps2TexHeader(
             reserved0=parsed.reserved0,
             reserved1=parsed.reserved1,
-            raster_offset=16,
+            raster_offset=raster_offset,
             flags=parsed.flags,
         )
         name, naming_mode = self._recover_texture_name(blob, res_id)
+        palette_bytes = 16 * 4 if header.bpp == 4 else 256 * 4 if header.bpp == 8 else 0
+        base_bytes = max(0, ((header.width * header.height * header.bpp) + 7) // 8)
+        block_size = min(len(blob) - raster_offset, max(base_bytes + palette_bytes, 0))
+        if block_size <= 0:
+            return None, naming_mode
 
         header_variants: list[Ps2TexHeader] = [_make_ps2_header_variant(header)]
         if header.width != header.height:
@@ -522,7 +545,7 @@ class LVZArchive:
         seen_variants: set[tuple[int, int, int]] = set()
         best_rgba: np.ndarray | None = None
         best_score = float("-inf")
-        nibble_orders = (True,) if header.bpp == 4 else (False,)
+        nibble_orders = (False, True) if header.bpp == 4 else (False,)
         for candidate_header in header_variants:
             variant_key = (candidate_header.width, candidate_header.height, candidate_header.swizzle_mask)
             if variant_key in seen_variants:
@@ -532,7 +555,7 @@ class LVZArchive:
                 rgba = decode_ps2_texture(
                     blob,
                     candidate_header,
-                    len(blob) - 16,
+                    block_size,
                     four_bit_high_nibble_first=high_nibble_first,
                 )
                 if rgba is None:
@@ -557,8 +580,13 @@ class LVZArchive:
     def texture_for_res_id(self, res_id: int) -> DecodedTexture | None:
         if res_id not in self.texture_cache:
             decoded = None
-            for blob, origin in self.resource_blobs_for_res_id(res_id):
-                decoded, _naming_mode = self._decode_texture_blob(blob, res_id, origin)
+            for variant in self.resource_variants_for_res_id(res_id):
+                decoded, _naming_mode = self._decode_texture_blob(
+                    variant.blob,
+                    res_id,
+                    variant.origin,
+                    raw_address=variant.raw_address,
+                )
                 if decoded is not None:
                     break
             self.texture_cache[res_id] = decoded

@@ -5,3 +5,4 @@
 .swp
 /tmp
 /src/vcs_map_extract/vendor/*
+/OUTPUT_DEBUG

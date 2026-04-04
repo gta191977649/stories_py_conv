@@ -157,7 +157,7 @@ class SectorInstance:
 @dataclass(slots=True)
 class ParsedSector:
     header: SectorHeader
-    resources: dict[int, bytes]
+    resources: dict[int, tuple[int, bytes]]
     instances_by_pass: list[list[SectorInstance]]
     swap_defs: list[LevelSwap]
 
@@ -425,7 +425,7 @@ class LevelChunk:
         return None
 
     @staticmethod
-    def _resource_slices(body: bytes, pointer_offsets: list[int]) -> dict[int, bytes]:
+    def _resource_slices(body: bytes, pointer_offsets: list[int]) -> dict[int, tuple[int, bytes]]:
         if len(body) < 8:
             return {}
         resources_ptr = _ptr_to_body_offset(_read_u32(body, 0))
@@ -433,25 +433,26 @@ class LevelChunk:
         if not (0 <= resources_ptr < len(body)):
             return {}
         count = min(num_resources, max(0, (len(body) - resources_ptr) // 8))
-        entries: list[tuple[int, int]] = []
+        entries: list[tuple[int, int, int]] = []
         for index in range(count):
             off = resources_ptr + (index * 8)
             if off + 8 > len(body):
                 break
             res_id = _read_u32(body, off)
-            data_ptr = _ptr_to_body_offset(_read_u32(body, off + 4))
+            raw_data_ptr = _read_u32(body, off + 4)
+            data_ptr = _ptr_to_body_offset(raw_data_ptr)
             if 0 <= data_ptr < len(body):
-                entries.append((res_id, data_ptr))
-        boundaries = sorted({len(body), resources_ptr, *[ptr for ptr in pointer_offsets if 0 <= ptr <= len(body)], *[data_ptr for _, data_ptr in entries]})
-        slices: dict[int, bytes] = {}
-        for res_id, data_ptr in entries:
+                entries.append((res_id, raw_data_ptr, data_ptr))
+        boundaries = sorted({len(body), resources_ptr, *[ptr for ptr in pointer_offsets if 0 <= ptr <= len(body)], *[data_ptr for _, _raw_data_ptr, data_ptr in entries]})
+        slices: dict[int, tuple[int, bytes]] = {}
+        for res_id, raw_data_ptr, data_ptr in entries:
             next_boundary = next((value for value in boundaries if value > data_ptr), len(body))
             if next_boundary > data_ptr:
-                slices.setdefault(res_id, body[data_ptr:next_boundary])
+                slices.setdefault(res_id, (raw_data_ptr, body[data_ptr:next_boundary]))
         return slices
 
 
-def parse_area_resource_table(level: LevelChunk, area: AreaInfo) -> dict[int, bytes]:
+def parse_area_resource_table(level: LevelChunk, area: AreaInfo) -> dict[int, tuple[int, bytes]]:
     chunk = level.img_bytes[area.file_offset : area.file_offset + area.file_size]
     if len(chunk) < LEVEL_BODY_OFFSET + 8 or _read_u32(chunk, 0) != AREA_IDENT:
         return {}
@@ -461,21 +462,21 @@ def parse_area_resource_table(level: LevelChunk, area: AreaInfo) -> dict[int, by
     if not (0 <= resources_ptr < len(body)):
         return {}
     count = min(num_resources, area.num_resources, max(0, (len(body) - resources_ptr) // 8))
-    entries: list[tuple[int, int]] = []
+    entries: list[tuple[int, int, int]] = []
     for index in range(count):
         off = resources_ptr + (index * 8)
         if off + 8 > len(body):
             break
-        res_id, _res_aux, data_ptr = struct.unpack_from("<hhI", body, off)
-        data_off = _ptr_to_body_offset(data_ptr)
+        res_id, _res_aux, raw_data_ptr = struct.unpack_from("<hhI", body, off)
+        data_off = _ptr_to_body_offset(raw_data_ptr)
         if 0 <= data_off < len(body):
-            entries.append((res_id & 0xFFFF, data_off))
-    boundaries = sorted({len(body), resources_ptr, *[data_ptr for _, data_ptr in entries]})
-    resources: dict[int, bytes] = {}
-    for res_id, data_off in entries:
+            entries.append((res_id & 0xFFFF, raw_data_ptr, data_off))
+    boundaries = sorted({len(body), resources_ptr, *[data_off for _, _raw_data_ptr, data_off in entries]})
+    resources: dict[int, tuple[int, bytes]] = {}
+    for res_id, raw_data_ptr, data_off in entries:
         next_boundary = next((value for value in boundaries if value > data_off), len(body))
         if next_boundary > data_off:
-            resources.setdefault(res_id, body[data_off:next_boundary])
+            resources.setdefault(res_id, (raw_data_ptr, body[data_off:next_boundary]))
     return resources
 
 

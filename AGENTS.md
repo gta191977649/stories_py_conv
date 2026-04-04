@@ -15,6 +15,7 @@ Core invariants:
 - When the active placement set resolves to one linked entity, the exporter uses that exact linked anchor for streamed localization.
 - Streamed resource lookup order is `AREA patched -> LVZ master -> sector overlay`.
 - A streamed `res_id` can have multiple candidate blobs. Try candidates; do not assume one blob per `res_id`.
+- Streamed texture blobs may be larger than the actual raster payload. Preserve the raw resource address, derive the local raster offset from the PS2 header, and size palette reads from the minimal raster block instead of the whole blob tail.
 - Streamed models are fragment assemblies. Do not collapse a model to one resource blob or one fragment.
 
 Critical constraints:
@@ -27,6 +28,7 @@ Critical constraints:
 Common failure modes:
 - Transform misuse: using the placement matrix directly, or anchoring against the wrong linked entity.
 - Incorrect resource resolution: using only the first blob for a `res_id`, or ignoring AREA-patched variants.
+- Incorrect streamed texture slicing: assuming the palette sits at the end of the whole resource blob, or dropping the raw resource pointer needed to recover the local raster offset.
 - Standard-IMG assumptions on streamed archives: expecting one named model file per model.
 
 Use these docs by task:
@@ -34,3 +36,10 @@ Use these docs by task:
 - Decoder work: [`/doc/playbooks/add_decoder.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/add_decoder.md)
 - Missing model: [`/doc/playbooks/debug_missing_model.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/debug_missing_model.md)
 - CLI changes: [`/doc/playbooks/add_cli_flag.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/playbooks/add_cli_flag.md)
+
+* Pleases update the cosponed task document when fixed.
+
+
+Toools:
+* python local env : project_dir/.venv
+* librw (renderware source if you need reference to rw implmentation): /Users/nurupo/Desktop/dev/librwgta-master

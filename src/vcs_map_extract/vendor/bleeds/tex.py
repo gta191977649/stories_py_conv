@@ -492,15 +492,20 @@ def decode_ps2_texture(
         pal_end = pal_start + pal_bytes_len
         if 0 <= pal_start < pal_end <= len(data):
             pal_bytes = data[pal_start:pal_end]
+            alpha_bytes = pal_bytes[3::4]
+            force_opaque_alpha = bool(alpha_bytes) and all(alpha == 0 for alpha in alpha_bytes)
             pal = []
             for i in range(0, len(pal_bytes), 4):
                 r = pal_bytes[i]
                 g = pal_bytes[i + 1]
                 b = pal_bytes[i + 2]
                 a = pal_bytes[i + 3]
-                a = int(a * 255 / 128)
-                if a > 255:
+                if force_opaque_alpha:
                     a = 255
+                else:
+                    a = int(a * 255 / 128)
+                    if a > 255:
+                        a = 255
                 pal.append((r, g, b, a))
         else:
             pal = None
