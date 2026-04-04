@@ -543,6 +543,7 @@ def plan_streamed_archive(
             linked_ipl_id=linked_ipl_id,
             world_id=instance.world_id,
             res_id=instance.res_id,
+            archive_name=archive_name,
             sector_id=visit.sector_id,
             pass_index=pass_index,
             source_kind=visit.source_kind,
@@ -604,16 +605,21 @@ def plan_streamed_archive(
             key=lambda item: _cluster_sort_key(item[1].values()),
         )
         placements = sorted(cluster_items[0][1].values(), key=_placement_sort_key)
+        for placement in placements:
+            placement.cluster_id = 0
+        alternate_placement_sets = []
+        for cluster_index, (_cluster_key, cluster) in enumerate(cluster_items[1:], start=1):
+            cluster_placements = sorted(cluster.values(), key=_placement_sort_key)
+            for placement in cluster_placements:
+                placement.cluster_id = cluster_index
+            alternate_placement_sets.append(cluster_placements)
         plan = StreamedModelPlan(
             model_name=model_name,
             output_name=model_name,
             txd_name=txd_name,
             source_file=source_file,
             placements=placements,
-            alternate_placement_sets=[
-                sorted(cluster.values(), key=_placement_sort_key)
-                for _cluster_key, cluster in cluster_items[1:]
-            ],
+            alternate_placement_sets=alternate_placement_sets,
             unresolved_name=False,
             has_hidden_alternates=model_hidden_alternates[model_name],
             export_kind="world_named",
@@ -635,9 +641,24 @@ def plan_streamed_archive(
             sorted(cluster.values(), key=_placement_sort_key)
             for _cluster_key, cluster in cluster_items
         ]
+        for cluster_index, placements in enumerate(sorted_clusters):
+            for placement in placements:
+                placement.cluster_id = cluster_index
         if export_kind == "interior_named" and sorted_clusters:
             existing_named_plan = named_plan_by_name.get(model_name)
             if existing_named_plan is not None:
+                next_cluster_id = 1 + max(
+                    (
+                        placement.cluster_id
+                        for cluster in [existing_named_plan.placements, *existing_named_plan.alternate_placement_sets]
+                        for placement in cluster
+                    ),
+                    default=0,
+                )
+                for cluster in sorted_clusters:
+                    for placement in cluster:
+                        placement.cluster_id = next_cluster_id
+                    next_cluster_id += 1
                 existing_named_plan.alternate_placement_sets.extend(sorted_clusters)
                 existing_named_plan.has_hidden_alternates = (
                     existing_named_plan.has_hidden_alternates

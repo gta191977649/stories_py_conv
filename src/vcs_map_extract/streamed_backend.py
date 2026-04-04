@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import struct
@@ -21,6 +22,11 @@ UNPACK = 0x6C018000
 STMASK = 0x20000000
 STROW = 0x30000000
 MSCAL = 0x14000006
+RESOURCE_ORIGIN_PRIORITY = {
+    "area": 0,
+    "master": 1,
+    "overlay": 2,
+}
 
 _LOG_SINK: Callable[[str], None] | None = None
 
@@ -106,6 +112,20 @@ class ParsedStreamedGeometry:
     unique_texture_res_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceBlobVariant:
+    res_id: int
+    origin: str
+    provenance: str
+    blob: bytes
+
+
+@dataclass(slots=True)
+class DecodedResourceVariant:
+    variant: ResourceBlobVariant
+    geometry: ParsedStreamedGeometry
+
+
 def _nearly_equal(a: float, b: float, eps: float = 1e-6) -> bool:
     return abs(a - b) <= eps
 
@@ -167,6 +187,44 @@ def _texture_decode_score(rgba: np.ndarray) -> float:
     delta_h = float(np.mean(np.abs(np.diff(rgba[:, :, :3].astype(np.int16), axis=1)))) if rgba.shape[1] > 1 else 0.0
     delta_v = float(np.mean(np.abs(np.diff(rgba[:, :, :3].astype(np.int16), axis=0)))) if rgba.shape[0] > 1 else 0.0
     return (horizontal_matches + vertical_matches) - ((delta_h + delta_v) / 255.0)
+
+
+def _blob_signature(blob: bytes) -> tuple[int, str]:
+    return (len(blob), hashlib.sha1(blob).hexdigest())
+
+
+def _variant_cache_key(variant: ResourceBlobVariant) -> tuple[int, str, int, str]:
+    return (
+        int(variant.res_id),
+        variant.origin,
+        len(variant.blob),
+        hashlib.sha1(variant.blob[:256]).hexdigest(),
+    )
+
+
+def _vertex_bounds_signature(vertices: list[tuple[float, float, float]]) -> tuple[float, ...]:
+    mins = [float("inf"), float("inf"), float("inf")]
+    maxs = [float("-inf"), float("-inf"), float("-inf")]
+    for x, y, z in vertices:
+        mins[0] = min(mins[0], x)
+        mins[1] = min(mins[1], y)
+        mins[2] = min(mins[2], z)
+        maxs[0] = max(maxs[0], x)
+        maxs[1] = max(maxs[1], y)
+        maxs[2] = max(maxs[2], z)
+    return tuple(round(value, 4) for value in (*mins, *maxs))
+
+
+def _matrix_signature(matrix: np.ndarray) -> tuple[float, ...]:
+    return tuple(round(float(value), 4) for value in matrix.reshape(-1))
+
+
+def _variant_sort_key(variant: ResourceBlobVariant) -> tuple[int, int, str]:
+    return (
+        RESOURCE_ORIGIN_PRIORITY.get(variant.origin, 99),
+        -len(variant.blob),
+        variant.provenance,
+    )
 
 
 def _finalize_geometry(
@@ -320,61 +378,99 @@ class LVZArchive:
         if lvz_path is None and root is None:
             raise ValueError("LVZArchive requires either root or lvz_path")
         self.level = level if level is not None else LevelChunk.from_archive((root or lvz_path.parent), archive_name)
-        self.master_raw_by_res_id = self._load_master_resources()
-        self.area_raw_by_res_id = self._load_area_resources()
-        self.overlay_raw_variants_by_res_id = self._load_sector_overlay_resources()
+        self.master_variants_by_res_id = self._load_master_resources()
+        self.area_variants_by_res_id = self._load_area_resources()
+        self.overlay_variants_by_res_id = self._load_sector_overlay_resources()
         self.known_hash_names = load_vcs_name_table()
         self.known_names = {name.lower(): name for name in self.known_hash_names.values()}
         self.texture_cache: dict[int, DecodedTexture | None] = {}
-        self.geometry_cache: dict[int, ParsedStreamedGeometry | None] = {}
+        self.geometry_cache: dict[tuple[int, str, int, str], ParsedStreamedGeometry | None] = {}
 
-    def _load_master_resources(self) -> dict[int, bytes]:
+    def _append_unique_variant(
+        self,
+        variants_by_res_id: dict[int, list[ResourceBlobVariant]],
+        *,
+        res_id: int,
+        origin: str,
+        provenance: str,
+        blob: bytes,
+    ) -> None:
+        variants = variants_by_res_id.setdefault(res_id, [])
+        signature = _blob_signature(blob)
+        if any(_blob_signature(existing.blob) == signature for existing in variants):
+            return
+        variants.append(
+            ResourceBlobVariant(
+                res_id=res_id,
+                origin=origin,
+                provenance=provenance,
+                blob=blob,
+            )
+        )
+
+    def _load_master_resources(self) -> dict[int, list[ResourceBlobVariant]]:
         pointers = self.level.read_master_resource_pointers()
         ordered = sorted((ptr, res_id) for res_id, ptr in pointers.items())
         boundaries = [ptr for ptr, _res_id in ordered] + [len(self.level.data)]
-        resources: dict[int, bytes] = {}
+        resources: dict[int, list[ResourceBlobVariant]] = {}
         for index, (ptr, res_id) in enumerate(ordered):
             end = boundaries[index + 1]
             if end > ptr:
-                resources[res_id] = self.level.data[ptr:end]
+                self._append_unique_variant(
+                    resources,
+                    res_id=res_id,
+                    origin="master",
+                    provenance="master",
+                    blob=self.level.data[ptr:end],
+                )
         return resources
 
-    def _load_area_resources(self) -> dict[int, bytes]:
-        resources: dict[int, bytes] = {}
+    def _load_area_resources(self) -> dict[int, list[ResourceBlobVariant]]:
+        resources: dict[int, list[ResourceBlobVariant]] = {}
         for area_index, area in enumerate(self.level.areas):
             _log(f"[streamed] {self.archive_name} area {area_index + 1}/{len(self.level.areas)}")
             for res_id, blob in parse_area_resource_table(self.level, area).items():
-                resources[res_id] = blob
+                self._append_unique_variant(
+                    resources,
+                    res_id=res_id,
+                    origin="area",
+                    provenance=f"area[{area_index}]",
+                    blob=blob,
+                )
         return resources
 
-    def _load_sector_overlay_resources(self) -> dict[int, list[bytes]]:
-        resources: dict[int, list[bytes]] = {}
+    def _load_sector_overlay_resources(self) -> dict[int, list[ResourceBlobVariant]]:
+        resources: dict[int, list[ResourceBlobVariant]] = {}
         reachable = self.level.iter_reachable_sectors()
         for sector_id in sorted(reachable):
             sector = self.level.parse_sector(sector_id)
             for res_id, blob in sector.resources.items():
-                variants = resources.setdefault(res_id, [])
-                signature = (len(blob), blob[:32])
-                if all((len(existing), existing[:32]) != signature for existing in variants):
-                    variants.append(blob)
+                self._append_unique_variant(
+                    resources,
+                    res_id=res_id,
+                    origin="overlay",
+                    provenance=f"sector[{sector_id}]",
+                    blob=blob,
+                )
         for variants in resources.values():
-            variants.sort(key=len, reverse=True)
+            variants.sort(key=lambda variant: len(variant.blob), reverse=True)
         return resources
 
-    def resource_blobs_for_res_id(self, res_id: int) -> list[tuple[bytes, str]]:
-        candidates: list[tuple[bytes, str]] = []
-        if res_id in self.area_raw_by_res_id:
-            candidates.append((self.area_raw_by_res_id[res_id], "area"))
-        if res_id in self.master_raw_by_res_id:
-            candidates.append((self.master_raw_by_res_id[res_id], "master"))
-        for blob in self.overlay_raw_variants_by_res_id.get(res_id, []):
-            candidates.append((blob, "overlay"))
+    def resource_variants_for_res_id(self, res_id: int) -> list[ResourceBlobVariant]:
+        candidates: list[ResourceBlobVariant] = []
+        candidates.extend(self.area_variants_by_res_id.get(res_id, []))
+        candidates.extend(self.master_variants_by_res_id.get(res_id, []))
+        candidates.extend(self.overlay_variants_by_res_id.get(res_id, []))
+        candidates.sort(key=_variant_sort_key)
         return candidates
 
+    def resource_blobs_for_res_id(self, res_id: int) -> list[tuple[bytes, str]]:
+        return [(variant.blob, variant.origin) for variant in self.resource_variants_for_res_id(res_id)]
+
     def resource_blob_for_res_id(self, res_id: int) -> tuple[bytes | None, str | None]:
-        candidates = self.resource_blobs_for_res_id(res_id)
+        candidates = self.resource_variants_for_res_id(res_id)
         if candidates:
-            return candidates[0]
+            return candidates[0].blob, candidates[0].origin
         return None, None
 
     def _recover_texture_name(self, blob: bytes, res_id: int) -> tuple[str, str]:
@@ -497,17 +593,35 @@ class LVZArchive:
             off += 1
         return materials, align_down4(off)
 
-    def _read_vec3_i16_norm(self, blob: bytes, offset: int) -> tuple[float, float, float]:
+    def _read_vec3_i16_norm(
+        self,
+        blob: bytes,
+        offset: int,
+        *,
+        denominator: float,
+        scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> tuple[float, float, float]:
         return (
-            read_i16(blob, offset + 0) / 32767.5,
-            read_i16(blob, offset + 2) / 32767.5,
-            read_i16(blob, offset + 4) / 32767.5,
+            (read_i16(blob, offset + 0) / denominator) * scale[0] + position[0],
+            (read_i16(blob, offset + 2) / denominator) * scale[1] + position[1],
+            (read_i16(blob, offset + 4) / denominator) * scale[2] + position[2],
         )
 
-    def _read_uv(self, blob: bytes, offset: int) -> tuple[float, float]:
-        return (blob[offset + 0] / 128.0, blob[offset + 1] / 128.0)
+    def _read_uv(self, blob: bytes, offset: int, *, denominator: float) -> tuple[float, float]:
+        return (blob[offset + 0] / denominator, blob[offset + 1] / denominator)
 
-    def _parse_one_batch(self, blob: bytes, pos: int, *, first_batch: bool) -> tuple[TriStrip, int]:
+    def _parse_one_batch(
+        self,
+        blob: bytes,
+        pos: int,
+        *,
+        first_batch: bool,
+        position_denominator: float,
+        uv_denominator: float,
+        position_scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        position_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> tuple[TriStrip, int]:
         pos = self._find_unpack_near(blob, align_down4(pos))
         if pos + 20 > len(blob):
             raise ValueError("Batch header truncated")
@@ -526,7 +640,16 @@ class LVZArchive:
         w += 4
         if w + (count_all * 6) > len(blob):
             raise ValueError("Position payload truncated")
-        verts = [self._read_vec3_i16_norm(blob, w + ((index + skip) * 6)) for index in range(count)]
+        verts = [
+            self._read_vec3_i16_norm(
+                blob,
+                w + ((index + skip) * 6),
+                denominator=position_denominator,
+                scale=position_scale,
+                position=position_offset,
+            )
+            for index in range(count)
+        ]
         w = align_up4(w + (count_all * 6))
         if read_u32(blob, w) != STMASK:
             raise ValueError("Missing STMASK before UVs")
@@ -539,7 +662,7 @@ class LVZArchive:
         w += 4
         if w + (count_all * 2) > len(blob):
             raise ValueError("UV payload truncated")
-        uvs = [self._read_uv(blob, w + ((index + skip) * 2)) for index in range(count)]
+        uvs = [self._read_uv(blob, w + ((index + skip) * 2), denominator=uv_denominator) for index in range(count)]
         w = align_up4(w + (count_all * 2))
         if (read_u32(blob, w) & 0xFF004000) != 0x6F000000:
             raise ValueError("Unexpected prelight header")
@@ -557,7 +680,16 @@ class LVZArchive:
             w += 4
         return TriStrip(count=count, verts=verts, uvs=uvs, colors=colors), w
 
-    def _parse_groups(self, blob: bytes, start_off: int) -> list[StripGroup]:
+    def _parse_groups(
+        self,
+        blob: bytes,
+        start_off: int,
+        *,
+        position_denominator: float = 32767.5,
+        uv_denominator: float = 127.5,
+        position_scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        position_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> list[StripGroup]:
         groups: list[StripGroup] = []
         try:
             off = self._find_unpack_near(blob, start_off)
@@ -568,7 +700,15 @@ class LVZArchive:
             if off >= len(blob):
                 break
             try:
-                strip, next_off = self._parse_one_batch(blob, off, first_batch=first_batch)
+                strip, next_off = self._parse_one_batch(
+                    blob,
+                    off,
+                    first_batch=first_batch,
+                    position_denominator=position_denominator,
+                    uv_denominator=uv_denominator,
+                    position_scale=position_scale,
+                    position_offset=position_offset,
+                )
             except (ValueError, struct.error):
                 break
             groups.append(StripGroup(strips=[strip], start_off=off, end_off=next_off))
@@ -635,7 +775,7 @@ class LVZArchive:
             cursor = packet_end
             if len(packet) < 16:
                 continue
-            groups = self._parse_groups(packet, 0)
+            groups = self._parse_groups(packet, 0, position_denominator=32767.0, uv_denominator=128.0)
             if not groups:
                 continue
             packet_strips: list[TriStrip] = []
@@ -699,12 +839,48 @@ class LVZArchive:
                 face_texture_res_ids.append(material_res_index)
         return _finalize_geometry(vertices, faces, uvs, vertex_colors, face_texture_res_ids, origin)
 
+    def _find_ps2_geometry_transform(
+        self,
+        blob: bytes,
+        unpack_offset: int,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+        header_size = 64
+        start_search = max(0, align_down4(unpack_offset - 128))
+        end_search = min(unpack_offset, len(blob) - header_size)
+        for header_start in range(start_search, end_search + 1, 4):
+            if header_start + header_size > len(blob):
+                break
+            dma_offset = struct.unpack_from("<H", blob, header_start + 26)[0]
+            if dma_offset <= 0 or header_start + dma_offset != unpack_offset:
+                continue
+            scale = struct.unpack_from("<3f", blob, header_start + 40)
+            position = struct.unpack_from("<3f", blob, header_start + 52)
+            if not all(math.isfinite(value) for value in (*scale, *position)):
+                continue
+            if max(abs(value) for value in (*scale, *position)) > 1_000_000.0:
+                continue
+            return (
+                (float(scale[0]), float(scale[1]), float(scale[2])),
+                (float(position[0]), float(position[1]), float(position[2])),
+            )
+        return None
+
     def _parse_embedded_unpack_geometry(self, blob: bytes, origin: str) -> ParsedStreamedGeometry | None:
         marker = struct.pack("<I", UNPACK)
         start = blob.find(marker)
         if start < 0:
             return None
-        groups = self._parse_groups(blob, start)
+        header_transform = self._find_ps2_geometry_transform(blob, start)
+        position_scale = header_transform[0] if header_transform is not None else (1.0, 1.0, 1.0)
+        position_offset = header_transform[1] if header_transform is not None else (0.0, 0.0, 0.0)
+        groups = self._parse_groups(
+            blob,
+            start,
+            position_denominator=32767.5,
+            uv_denominator=127.5,
+            position_scale=position_scale,
+            position_offset=position_offset,
+        )
         return self._groups_to_geometry(groups, origin)
 
     def _parse_position_only_geometry(self, blob: bytes, origin: str) -> ParsedStreamedGeometry | None:
@@ -712,6 +888,9 @@ class LVZArchive:
         off = blob.find(marker)
         if off < 0:
             return None
+        header_transform = self._find_ps2_geometry_transform(blob, off)
+        position_scale = header_transform[0] if header_transform is not None else (1.0, 1.0, 1.0)
+        position_offset = header_transform[1] if header_transform is not None else (0.0, 0.0, 0.0)
 
         vertices: list[tuple[float, float, float]] = []
         faces: list[tuple[int, int, int]] = []
@@ -738,7 +917,16 @@ class LVZArchive:
             w += 4
             if w + (count_all * 6) > len(blob):
                 break
-            batch_vertices = [self._read_vec3_i16_norm(blob, w + ((index + skip) * 6)) for index in range(count)]
+            batch_vertices = [
+                self._read_vec3_i16_norm(
+                    blob,
+                    w + ((index + skip) * 6),
+                    denominator=32767.5,
+                    scale=position_scale,
+                    position=position_offset,
+                )
+                for index in range(count)
+            ]
             base = len(vertices)
             vertices.extend(batch_vertices)
             batch_uvs = [(0.0, 0.0)] * count
@@ -757,25 +945,47 @@ class LVZArchive:
 
         return _finalize_geometry(vertices, faces, uvs, vertex_colors, face_texture_res_ids, origin)
 
-    def geometry_for_res_id(self, res_id: int) -> ParsedStreamedGeometry | None:
-        if res_id in self.geometry_cache:
-            return self.geometry_cache[res_id]
-        geometry = None
-        for blob, origin in self.resource_blobs_for_res_id(res_id):
-            geometry = self._parse_streamed_geometry_blob(blob, origin)
-            if geometry is None:
-                materials, next_off = self._parse_mdl_material_list(blob, 0)
-                groups = self._parse_groups(blob, next_off)
-                self._assign_materials(materials, groups)
-                geometry = self._groups_to_geometry(groups, origin)
-            if geometry is None:
-                geometry = self._parse_embedded_unpack_geometry(blob, origin)
-            if geometry is None:
-                geometry = self._parse_position_only_geometry(blob, origin)
-            if geometry is not None:
-                break
-        self.geometry_cache[res_id] = geometry
+    def geometry_for_variant(self, variant: ResourceBlobVariant) -> ParsedStreamedGeometry | None:
+        cache_key = _variant_cache_key(variant)
+        if cache_key in self.geometry_cache:
+            return self.geometry_cache[cache_key]
+        geometry = self._parse_streamed_geometry_blob(variant.blob, variant.origin)
+        if geometry is None:
+            materials, next_off = self._parse_mdl_material_list(variant.blob, 0)
+            header_transform = self._find_ps2_geometry_transform(variant.blob, next_off)
+            position_scale = header_transform[0] if header_transform is not None else (1.0, 1.0, 1.0)
+            position_offset = header_transform[1] if header_transform is not None else (0.0, 0.0, 0.0)
+            groups = self._parse_groups(
+                variant.blob,
+                next_off,
+                position_denominator=32767.5,
+                uv_denominator=127.5,
+                position_scale=position_scale,
+                position_offset=position_offset,
+            )
+            self._assign_materials(materials, groups)
+            geometry = self._groups_to_geometry(groups, variant.origin)
+        if geometry is None:
+            geometry = self._parse_embedded_unpack_geometry(variant.blob, variant.origin)
+        if geometry is None:
+            geometry = self._parse_position_only_geometry(variant.blob, variant.origin)
+        self.geometry_cache[cache_key] = geometry
         return geometry
+
+    def decoded_variants_for_res_id(self, res_id: int) -> list[DecodedResourceVariant]:
+        decoded: list[DecodedResourceVariant] = []
+        for variant in self.resource_variants_for_res_id(res_id):
+            geometry = self.geometry_for_variant(variant)
+            if geometry is None:
+                continue
+            decoded.append(DecodedResourceVariant(variant=variant, geometry=geometry))
+        return decoded
+
+    def geometry_for_res_id(self, res_id: int) -> ParsedStreamedGeometry | None:
+        decoded = self.decoded_variants_for_res_id(res_id)
+        if decoded:
+            return decoded[0].geometry
+        return None
 
 
 def rw_matrix(values: tuple[float, ...]) -> np.ndarray:
@@ -918,6 +1128,61 @@ def merge_texture(existing: DecodedTexture, incoming: DecodedTexture) -> Decoded
     return existing
 
 
+def _cluster_sets_for_model(model) -> list[list[StreamedPlacement]]:
+    return [cluster for cluster in [model.placements, *model.alternate_placement_sets] if cluster]
+
+
+def _cluster_eval_placements(placements: list[StreamedPlacement]) -> list[StreamedPlacement]:
+    visible = [placement for placement in placements if placement.visible]
+    return visible or placements
+
+
+def _resolve_single_linked_inverse(placements: list[StreamedPlacement], ipl_summary) -> tuple[np.ndarray | None, int | None]:
+    linked_ids = {
+        placement.linked_ipl_id
+        for placement in placements
+        if placement.linked_ipl_id is not None
+    }
+    if len(linked_ids) != 1:
+        return None, None
+    return _resolve_exact_linked_inverse(placements, ipl_summary)
+
+
+def _cluster_localized_signatures(
+    placements: list[StreamedPlacement],
+    *,
+    ipl_summary,
+) -> tuple[tuple[float, ...], ...]:
+    eval_placements = _cluster_eval_placements(placements)
+    base_inverse, _base_placement = choose_base_transform(eval_placements)
+    exact_inverse, _exact_linked_id = _resolve_single_linked_inverse(eval_placements, ipl_summary)
+    if exact_inverse is not None:
+        base_inverse = exact_inverse
+    localized = {
+        _matrix_signature(base_inverse @ rw_matrix(placement.matrix))
+        for placement in eval_placements
+    }
+    return tuple(sorted(localized))
+
+
+def _model_clusters_are_consistent(model, *, ipl_summary) -> tuple[bool, list[tuple[int, tuple[tuple[float, ...], ...]]]]:
+    cluster_signatures: list[tuple[int, tuple[tuple[float, ...], ...]]] = []
+    for cluster_index, placements in enumerate(_cluster_sets_for_model(model)):
+        cluster_signatures.append(
+            (
+                cluster_index,
+                _cluster_localized_signatures(
+                    placements,
+                    ipl_summary=ipl_summary,
+                ),
+            )
+        )
+    if len(cluster_signatures) <= 1:
+        return True, cluster_signatures
+    unique_signatures = {signature for _cluster_index, signature in cluster_signatures}
+    return len(unique_signatures) == 1, cluster_signatures
+
+
 def export_streamed_archive(
     archive_name: str,
     root: Path,
@@ -976,6 +1241,15 @@ def export_streamed_archive(
             if on_model_done is not None:
                 on_model_done(archive_name, model, False)
             continue
+        clusters_consistent, cluster_signatures = _model_clusters_are_consistent(model, ipl_summary=ipl_summary)
+        if not clusters_consistent:
+            summary = ", ".join(
+                f"cluster {cluster_index}: {len(signature)} localized transform(s)"
+                for cluster_index, signature in cluster_signatures
+            )
+            report.streamed_diagnostics.append(
+                f"{archive_name}: {model.output_name} has alternate placement cluster disagreement after localization ({summary}); exporting primary cluster only"
+            )
         _log(
             f"[streamed] {archive_name} model {model.model_name}: "
             f"{len(model.placements)} resource candidates"
@@ -996,6 +1270,8 @@ def export_streamed_archive(
         recovered_only_from_hidden = False
         bad_fragments_for_model = 0
         vertex_colors: list[tuple[int, int, int, int]] = []
+        localized_bounds_counts_by_res_id: dict[int, dict[tuple[float, ...], int]] = {}
+        reported_multi_variant_res_ids: set[int] = set()
 
         base_inverse, base_placement = choose_base_transform(visible_placements or hidden_placements)
         if base_placement is None:
@@ -1007,37 +1283,73 @@ def export_streamed_archive(
                 f"{archive_name}: skipped degenerate base placement for {model.model_name}; "
                 f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
             )
-        exact_inverse, exact_linked_id = _resolve_exact_linked_inverse(visible_placements or hidden_placements, ipl_summary)
+        exact_inverse, exact_linked_id = _resolve_single_linked_inverse(visible_placements or hidden_placements, ipl_summary)
         if exact_inverse is not None:
             base_inverse = exact_inverse
-            report.interior_diagnostics.append(
-                f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
-            )
+            if model.export_kind.startswith("interior"):
+                report.interior_diagnostics.append(
+                    f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
+                )
+            else:
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
+                )
 
         for set_index, placements in enumerate(placement_sets):
             fallback_mode = set_index > 0
             before_faces = len(faces)
             for placement in placements:
-                blob, _origin = archive.resource_blob_for_res_id(placement.res_id)
-                if blob is None:
+                raw_variants = archive.resource_variants_for_res_id(placement.res_id)
+                if not raw_variants:
                     no_resource_res_ids += 1
                     missing_res_ids += 1
                     continue
                 try:
-                    geometry = archive.geometry_for_res_id(placement.res_id)
+                    decoded_variants = archive.decoded_variants_for_res_id(placement.res_id)
                 except Exception:
-                    geometry = None
-                if geometry is None:
+                    decoded_variants = []
+                if not decoded_variants:
                     decode_failed_res_ids += 1
                     missing_res_ids += 1
                     continue
-                fragment_key = (placement.res_id, len(geometry.faces), len(geometry.vertices))
-                if fragment_key in seen_fragments:
-                    continue
-                seen_fragments.add(fragment_key)
                 local_matrix = base_inverse @ rw_matrix(placement.matrix)
-                transformed_vertices = [transform_point(local_matrix, vertex) for vertex in geometry.vertices]
-                if not _fragment_vertices_valid(transformed_vertices):
+                candidate_rows: list[
+                    tuple[int, int, int, int, DecodedResourceVariant, list[tuple[float, float, float]], tuple[float, ...]]
+                ] = []
+                decoded_signatures: set[tuple[str, tuple[float, ...]]] = set()
+                signature_counts = localized_bounds_counts_by_res_id.setdefault(placement.res_id, {})
+                dominant_signature = None
+                dominant_count = 0
+                for signature, count in signature_counts.items():
+                    if count > dominant_count:
+                        dominant_signature = signature
+                        dominant_count = count
+                for decoded_variant in decoded_variants:
+                    transformed_vertices = [
+                        transform_point(local_matrix, vertex)
+                        for vertex in decoded_variant.geometry.vertices
+                    ]
+                    if not _fragment_vertices_valid(transformed_vertices):
+                        continue
+                    bounds_signature = _vertex_bounds_signature(transformed_vertices)
+                    decoded_signatures.add((decoded_variant.variant.origin, bounds_signature))
+                    candidate_rows.append(
+                        (
+                            1 if dominant_signature is not None and bounds_signature == dominant_signature else 0,
+                            -RESOURCE_ORIGIN_PRIORITY.get(decoded_variant.variant.origin, 99),
+                            len(decoded_variant.geometry.faces),
+                            len(decoded_variant.geometry.vertices),
+                            decoded_variant,
+                            transformed_vertices,
+                            bounds_signature,
+                        )
+                    )
+                if len(decoded_signatures) > 1 and placement.res_id not in reported_multi_variant_res_ids:
+                    reported_multi_variant_res_ids.add(placement.res_id)
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: {model.model_name} res_id={placement.res_id} has {len(decoded_signatures)} decoded streamed variants"
+                    )
+                if not candidate_rows:
                     skipped_bad_fragments += 1
                     bad_fragments_for_model += 1
                     report.streamed_diagnostics.append(
@@ -1046,6 +1358,20 @@ def export_streamed_archive(
                         f"source={placement.source_kind})"
                     )
                     continue
+                _match_dominant, _origin_rank, _face_count, _vert_count, selected_variant, transformed_vertices, bounds_signature = max(
+                    candidate_rows,
+                    key=lambda item: (item[0], item[1], item[2], item[3]),
+                )
+                signature_counts[bounds_signature] = signature_counts.get(bounds_signature, 0) + 1
+                geometry = selected_variant.geometry
+                fragment_key = (
+                    placement.res_id,
+                    *_variant_cache_key(selected_variant.variant),
+                    *bounds_signature,
+                )
+                if fragment_key in seen_fragments:
+                    continue
+                seen_fragments.add(fragment_key)
                 base_index = len(vertices)
                 vertices.extend(transformed_vertices)
                 uvs.extend(geometry.uvs)
@@ -1173,9 +1499,9 @@ def export_streamed_archive(
         "interior_unresolved_skips": interior_unresolved_skips,
         "exported_txds": sum(1 for txd_name, textures in textures_by_txd.items() if textures and txd_name.lower() != "knackers"),
         "decoded_textures": sum(1 for texture in archive.texture_cache.values() if texture is not None),
-        "loaded_master_resource_blobs": len(archive.master_raw_by_res_id),
-        "loaded_area_resource_blobs": len(archive.area_raw_by_res_id),
-        "loaded_overlay_resource_blobs": len(archive.overlay_raw_variants_by_res_id),
+        "loaded_master_resource_blobs": sum(len(variants) for variants in archive.master_variants_by_res_id.values()),
+        "loaded_area_resource_blobs": sum(len(variants) for variants in archive.area_variants_by_res_id.values()),
+        "loaded_overlay_resource_blobs": sum(len(variants) for variants in archive.overlay_variants_by_res_id.values()),
     }
 
 

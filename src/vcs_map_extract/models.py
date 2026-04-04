@@ -52,11 +52,13 @@ class StreamedPlacement:
     linked_ipl_id: int | None
     world_id: int
     res_id: int
+    archive_name: str
     sector_id: int
     pass_index: int
     source_kind: str
     visible: bool
     matrix: tuple[float, ...]
+    cluster_id: int = 0
     placement_count: int = 1
 
 
