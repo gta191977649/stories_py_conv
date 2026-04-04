@@ -552,9 +552,9 @@ def _matrix_to_frame_components(matrix: object):
     rows = tuple(tuple(float(value) for value in row) for row in matrix)
     return (
         dragon_dff.Matrix(
-            dragon_dff.Vector(rows[0][0], rows[1][0], rows[2][0]),
-            dragon_dff.Vector(rows[0][1], rows[1][1], rows[2][1]),
-            dragon_dff.Vector(rows[0][2], rows[1][2], rows[2][2]),
+            dragon_dff.Vector(rows[0][0], rows[0][1], rows[0][2]),
+            dragon_dff.Vector(rows[1][0], rows[1][1], rows[1][2]),
+            dragon_dff.Vector(rows[2][0], rows[2][1], rows[2][2]),
         ),
         dragon_dff.Vector(rows[0][3], rows[1][3], rows[2][3]),
     )

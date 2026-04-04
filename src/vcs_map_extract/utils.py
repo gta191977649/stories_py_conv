@@ -5,8 +5,32 @@ import zlib
 from pathlib import Path
 
 
+def _recover_common_absolute_path_typos(path: str | Path) -> Path | None:
+    raw = str(path).strip()
+    if not raw:
+        return None
+
+    candidates: list[str] = []
+    if raw.startswith("Users/"):
+        candidates.append(f"/{raw}")
+    if raw.startswith("sers/"):
+        candidates.append(f"/U{raw}")
+    if raw.startswith("ers/"):
+        candidates.append(f"/Us{raw}")
+
+    for candidate in candidates:
+        resolved = Path(candidate).expanduser().resolve()
+        if resolved.exists():
+            return resolved
+    return None
+
+
 def normalize_input_root(path: str | Path) -> Path:
     candidate = Path(path).expanduser().resolve()
+    if not candidate.exists():
+        recovered = _recover_common_absolute_path_typos(path)
+        if recovered is not None:
+            candidate = recovered
     if candidate.is_file():
         return candidate.parent
     return candidate
