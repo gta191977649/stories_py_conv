@@ -461,6 +461,8 @@ def decode_ps2_texture(
     thdr: Ps2TexHeader,
     block_size: int,
     palette_override: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    *,
+    four_bit_high_nibble_first: bool = False,
 ) -> Optional[np.ndarray]:
     w = thdr.width
     h = thdr.height
@@ -506,10 +508,14 @@ def decode_ps2_texture(
         idx = np.empty(pixel_count, dtype=np.uint8)
         for i in range(pixel_count // 2):
             byte = raw[i]
-            idx[i * 2] = byte & 0x0F
-            idx[i * 2 + 1] = byte >> 4
+            if four_bit_high_nibble_first:
+                idx[i * 2] = byte >> 4
+                idx[i * 2 + 1] = byte & 0x0F
+            else:
+                idx[i * 2] = byte & 0x0F
+                idx[i * 2 + 1] = byte >> 4
         if pixel_count % 2:
-            idx[-1] = raw[pixel_count // 2] & 0x0F
+            idx[-1] = (raw[pixel_count // 2] >> 4) if four_bit_high_nibble_first else (raw[pixel_count // 2] & 0x0F)
         if thdr.swizzle_mask & 1:
             idx = unswizzle_ps2_indices(idx, w, h)
     elif bpp == 8:
@@ -550,5 +556,3 @@ def decode_ps2_texture(
 ###############################################################################
 # Main decoding logic for Blender
 ###############################################################################
-
-

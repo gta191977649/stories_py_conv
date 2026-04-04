@@ -27,22 +27,98 @@ vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out
 ```
 
 ```bash
-vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out --packimg
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --buildimg
 ```
 
 If you do not want to install the console script first:
 
 ```bash
 cd /Users/nurupo/Desktop/dev/stories_py_conv
-PYTHONPATH=src python3 -m vcs_map_extract.cli /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out --packimg
+PYTHONPATH=src python3 -m vcs_map_extract.cli /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --buildimg
 ```
 
 Or run directly from the checkout root:
 
 ```bash
 cd /Users/nurupo/Desktop/dev/stories_py_conv
-./.venv/bin/python main.py /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --packimg
+./.venv/bin/python main.py /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --buildimg
 ```
+
+## Arguments
+
+CLI shape:
+
+```text
+vcs-map-extract INPUT OUTPUT [--clean] [--export] [--buildimg] [--decode-dat] [--dxt-level {1,2,3,4,5}]
+```
+
+Positional arguments:
+
+- `INPUT`
+  - game root directory such as `/Users/nurupo/Desktop/ps2/GAME`
+  - or an IMG sidecar `.DIR` file such as `MOCAPPS2.DIR`
+- `OUTPUT`
+  - destination directory for generated files
+
+Options:
+
+- `--clean`
+  - remove everything under `OUTPUT` before running any other action
+- `--export`
+  - export models, textures, and collisions into `OUTPUT`
+  - this is the flag that actually performs asset extraction
+- `--buildimg`
+  - pack generated `.dff/.txd/.col` outputs into `OUTPUT/vcs_map.img`
+  - also rebuild `OUTPUT/GTA3PS2.img` from the exported `OUTPUT/GTA3PS2/` files
+  - requires `--export`
+- `--decode-dat`
+  - decode `GAME.dat` into generated IDE/IPL text files under `OUTPUT/data/`
+  - can be used by itself or together with `--export`
+- `--dxt-level {1,2,3,4,5}`
+  - write exported `.txd` files using DXT compression instead of uncompressed rasters
+  - applies to standard archive TXDs, streamed archive TXDs, and the final root `knackers.txd`
+  - when omitted, TXDs are written uncompressed as before
+  - mapping:
+    - `1` -> DXT1
+    - `2` -> DXT2
+    - `3` -> DXT3
+    - `4` -> DXT4
+    - `5` -> DXT5
+  - example: `--dxt-level 3` writes DXT3-compressed TXDs
+
+Common command lines:
+
+```bash
+# clean the output directory only
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --clean
+
+# export models/textures/collisions
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export
+
+# export TXDs as DXT3
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --dxt-level 3
+
+# clean, then export
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --clean --export
+
+# export and build vcs_map.img plus GTA3PS2.img
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --export --buildimg
+
+# decode GAME.dat only
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --decode-dat
+
+# decode GAME.dat and export assets in one run
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME /tmp/vcs_out --decode-dat --export
+
+# export from a DIR sidecar path
+vcs-map-extract /Users/nurupo/Desktop/ps2/GAME/MOCAPPS2.DIR /tmp/vcs_out --export
+```
+
+Important CLI rules:
+
+- At least one action must be selected: `--clean`, `--export`, or `--decode-dat`.
+- `--buildimg` cannot be used alone; it must be combined with `--export`.
+- `--dxt-level` is only meaningful when `--export` is also used, because TXDs are only written during export.
 
 ## Output
 
@@ -55,7 +131,8 @@ The tool writes:
 - `OUTPUT/MALL/`
 - `OUTPUT/knackers.txd`
 - `OUTPUT/report.txt`
-- `OUTPUT/vcs_map.img` when `--packimg` is used
+- `OUTPUT/vcs_map.img` when `--buildimg` is used
+- `OUTPUT/GTA3PS2.img` when `--buildimg` is used
 
 ## Streamed Archive Structure
 
@@ -65,9 +142,12 @@ The standard archives are conventional GTA-style IMG archives:
 GTA3PS2.IMG
 MOCAPPS2.IMG
 └── named entries
-    ├── *.mdl
-    ├── *.tex / *.xtx / *.chk
-    └── *.col2
+    ├── *.mdl                  (model)
+    ├── *.tex / *.xtx / *.chk  (texture)
+    ├── *.anim                 (animation)
+    ├── *.cut                  (cutscene definition file)
+    ├── *.cam                  (camera motion file for cutscene)
+    └── *.col2                 (collision file)
 ```
 
 Important: `MOCAPPS2.IMG` is not a pure map archive. It contains non-static assets such as cutscene, animation, and related story resources. This tool does not try to convert those. For `MOCAPPS2.IMG`, the current scope is still only static/map-style resources that can be exported as:
@@ -213,12 +293,28 @@ Streamed archives do not store clean filenames for buildings. The tool resolves 
 sGeomInstance.id & 0x7FFF
 -> world/building id
 -> vcs_links.inc
--> IDE model id
+   ├── linked entity id   (building/treadable/dummy pool slot)
+   └── IDE model id
 -> inputdir/ide/*.ide
 -> final model name / txd name
 ```
 
 This is why the LVZ/IMG pair must be processed together with the IDEs.
+
+Important: `vcs_links.inc` is not just a naming table. Its second field is the exact runtime entity id used by the original Leeds tools and engine-side linkage:
+
+```text
+world id
+-> linked entity id
+   ├── upper 16 bits: entity pool
+   │   ├── 0 = building
+   │   ├── 1 = treadable
+   │   └── 2 = dummy
+   └── lower 16 bits: slot inside that pool
+-> model id
+```
+
+That linked entity id is the authoritative anchor for transform reconstruction. Treating it as "just another model reference" causes bad pivots, bad 2DFX placement, and wrong headings for some streamed models.
 
 Important: the extracted `ipl/*.ipl` files in this dump do not expose streamed interiors. In the real test data:
 
@@ -260,6 +356,139 @@ IDE model name
 -> merged area-backed fragments
 -> one output model file under the archive folder
 ```
+
+### Transform model
+
+This is the most important reverse-engineering detail in the repo.
+
+`WRLD` instance records are not equivalent to final GTA-style `inst` rows. They are streamed fragment placements. The canonical object transform still lives in the linked entity pools from `GAME.dat`.
+
+#### Matrix layout
+
+`sGeomInstance.matrix` is read as 16 floats with RenderWare-style basis vectors:
+
+```text
+right.x right.y right.z rightw
+up.x    up.y    up.z    upw
+at.x    at.y    at.z    atw
+pos.x   pos.y   pos.z   posw
+```
+
+For valid visible world fragments, the useful parts are:
+
+- `right/up/at` = local basis vectors, often including baked scale
+- `pos` = translation
+- `rightw/upw/atw` are expected to be `0`
+- `posw` is expected to be `1`
+
+The streamed geometry decoder keeps vertices in their decoded local blob space. Placement and localization happen later via these matrices.
+
+#### Canonical anchor
+
+When a streamed model has a `vcs_links.inc` entry, the correct anchor is:
+
+```text
+world id
+-> vcs_links.inc
+-> linked entity id
+-> GAME.dat building/treadable/dummy pool matrix
+```
+
+That pool/entity matrix is the same anchor used by the original `storiesview` / `storiesconv` tools. It is more accurate than:
+
+- nearest-by-name IPL matching
+- first visible streamed placement
+- sector origin plus WRLD matrix alone
+
+#### DFF localization rule
+
+For streamed DFF export, model-local coordinates should be built like this:
+
+```text
+local fragment matrix
+= inverse(linked entity matrix) * streamed placement matrix
+```
+
+In words:
+
+- the linked entity matrix defines the canonical GTA object transform
+- the WRLD matrix defines where one streamed fragment sits relative to that object
+- the exported DFF should keep only the residual local transform
+
+If the exact linked entity transform is missing, the current fallback is:
+
+```text
+nearest exact IPL/model transform from GAME.dat/IPL summary
+-> else best non-degenerate streamed placement
+-> else identity
+```
+
+This exact-anchor rule fixed the pivot/2DFX regression where interior lights were ending up outside the room after export.
+
+#### IPL generation rule
+
+Generated `wrld_stream.ipl` rows should use the same canonical anchor as DFF export:
+
+```text
+linked entity transform from GAME.dat
+-> write IPL inst row
+```
+
+Do not write those rows directly from the raw WRLD absolute matrix when an exact linked entity transform exists. Doing that makes the placement file disagree with the localized DFF, so models appear translated even if the mesh itself was exported correctly.
+
+#### Quaternion convention
+
+The IPL quaternion convention in this repo must match the matrix builder used later by the streamed exporter.
+
+The practical rule is:
+
+```text
+matrix -> quaternion
+use (x, y, z, w)
+do not negate xyz
+```
+
+Negating `x/y/z` makes some objects appear to have the correct position but the wrong heading. For instance `JM_marinex` was the sanity-check model that exposed this issue: the old quaternion sign convention reconstructed a rotated anchor, while the corrected convention reduced the residual local transform to scale-only as expected.
+
+#### Sanity checks for developers
+
+If a streamed model still looks wrong, check these in order:
+
+1. Is the model linked through `vcs_links.inc`?
+2. Does the linked entity id resolve to a real `GAME.dat` pool transform?
+3. Does `inverse(anchor) * placement` leave a plausible local matrix?
+4. Does the generated IPL row use the same anchor transform as the DFF export?
+5. Do quaternion -> matrix -> localization paths all agree on handedness/sign?
+
+For a healthy export, the residual local matrix for a correctly linked fragment should usually look like:
+
+- mostly diagonal scale, or
+- a small fixed local offset/rotation shared across every fragment of that model
+
+It should not look like a second large world rotation layered on top of the anchor.
+
+### Standard vs streamed duplicates
+
+Some IDE model names exist in both:
+
+- the normal `GAME.dat` entity pools / base IPLs
+- streamed `WRLD` resources
+
+That does not always mean the streamed copy is the canonical world placement. In practice:
+
+- base pool/entity transforms are the authoritative placement anchor
+- streamed resources often provide fragment geometry for that same object
+- interior/swap-sector traversals can surface additional copies of the same model name
+
+So developers should avoid assuming:
+
+```text
+same model name
+-> same placement source
+-> safe to merge blindly
+```
+
+Name equality is not enough. Always check the linked entity id and source kind.
 
 ### Streamed decoder behavior
 
@@ -318,11 +547,12 @@ This prevents one corrupt streamed fragment from causing the whole model export 
 - The required pure-Python helper code is also vendored in this repo, so the tool no longer depends on sibling checkouts of `g3DTZ`, `librwgta`, `BLeeds`, or `DragonFF`.
 - `BEACH`, `MAINLA`, and `MALL` now use a pure-Python streamed exporter with world, interior, and area-resource loading.
 - Streamed neon/light resources are now handled as best-effort geometry too, including small wrapped transparent-pass blobs that only expose position strips.
+- Streamed transform reconstruction now uses exact linked entity anchors from `GAME.dat` when available, both for DFF localization and generated streamed IPL rows.
+- The IPL quaternion conversion now matches the streamed exporter matrix convention; this fixed wrong headings for some anchored models such as `JM_marinex`.
 - Coverage is still best-effort: some streamed resources are malformed, unresolved, or too extreme for DragonFF mesh/collision writers, and those cases are recorded in `report.txt` instead of aborting the run.
 
 
 # Issues (TODO)
-* Model transform (Some model were rotated incorrectly, and transformed incorrectly in relation to their origin) based on ipl coordinate (perhaps is model convertion issue? wrong center origin?)
-* No Vertex color is ripped on model.
 * Incorrect TOBJ
-* Interior Obj is missing?
+* Some interior/swap resources still need better classification and dedupe rules.
+* More documentation is still needed for malformed swap-sector placements and non-geometry resource classes.

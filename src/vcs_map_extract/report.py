@@ -40,8 +40,16 @@ def write_report(path: Path, report: ReportData) -> None:
     lines.extend(report.streamed_diagnostics or ["<none>"])
 
     lines.append("")
+    lines.append("Interior Diagnostics")
+    lines.extend(report.interior_diagnostics or ["<none>"])
+
+    lines.append("")
     lines.append("Duplicate Pack Conflicts")
     lines.extend(report.duplicate_pack_conflicts or ["<none>"])
+
+    lines.append("")
+    lines.append("Streamed Texture Conflicts")
+    lines.extend(report.streamed_texture_conflicts or ["<none>"])
 
     lines.append("")
     lines.append("Knackers Texture Conflicts")
