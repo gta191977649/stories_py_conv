@@ -26,3 +26,4 @@ Task file format:
 
 Current tasks:
 - [`/doc/tasks/T001 TXD Packing Opaque DXT Policy.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T001%20TXD%20Packing%20Opaque%20DXT%20Policy.md)
+- [`/doc/tasks/T002 TXD Packing Quality Gate.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T002%20TXD%20Packing%20Quality%20Gate.md)

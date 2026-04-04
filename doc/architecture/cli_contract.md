@@ -23,6 +23,7 @@ Flags:
 - `--dxt-level`
   - controls TXD compression during export
   - applies per texture; opaque rasters still emit `DXT1/RASTER_565` when a higher alpha-capable DXT level is requested
+  - may fall back to uncompressed per texture when the compressed roundtrip exceeds the current deterministic quality gate
 
 Validation rules:
 - At least one of `--clean`, `--export`, or `--decode-dat` must be set.

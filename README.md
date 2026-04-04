@@ -101,6 +101,7 @@ Options:
   - applies to standard archive TXDs, streamed archive TXDs, and the final root `knackers.txd`
   - when omitted, TXDs are written uncompressed as before
   - opaque textures still pack as `DXT1/RASTER_565` even when a higher DXT level is requested, matching the current `librw` path
+  - textures whose DXT roundtrip is too destructive fall back to uncompressed output instead of being forced through a visibly broken compressed raster
   - mapping:
     - `1` -> DXT1
     - `2` -> DXT2
