@@ -190,6 +190,14 @@ def _texture_decode_score(rgba: np.ndarray) -> float:
     return (horizontal_matches + vertical_matches) - ((delta_h + delta_v) / 255.0)
 
 
+def _is_plausible_embedded_texture_name(candidate: str) -> bool:
+    if len(candidate) < 4:
+        return False
+    if candidate.lower() != candidate:
+        return False
+    return any("a" <= char <= "z" for char in candidate)
+
+
 def _blob_signature(blob: bytes) -> tuple[int, str]:
     return (len(blob), hashlib.sha1(blob).hexdigest())
 
@@ -504,6 +512,8 @@ class LVZArchive:
             try:
                 candidate = match.group(0).decode("ascii")
             except UnicodeDecodeError:
+                continue
+            if not _is_plausible_embedded_texture_name(candidate):
                 continue
             resolved = known_names.get(candidate.lower())
             if resolved:

@@ -27,3 +27,5 @@ Task file format:
 Current tasks:
 - [`/doc/tasks/T001 TXD Packing Opaque DXT Policy.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T001%20TXD%20Packing%20Opaque%20DXT%20Policy.md)
 - [`/doc/tasks/T002 TXD Packing Quality Gate.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T002%20TXD%20Packing%20Quality%20Gate.md)
+- [`/doc/tasks/T003 Streamed Texture Name Noise Filter.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T003%20Streamed%20Texture%20Name%20Noise%20Filter.md)
+- [`/doc/tasks/T004 Opaque DXT1 Transparent Block Fix.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T004%20Opaque%20DXT1%20Transparent%20Block%20Fix.md)

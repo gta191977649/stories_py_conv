@@ -210,6 +210,10 @@ def _select_color_endpoints(block_rgb: np.ndarray, *, use_three_color: bool) -> 
         return 0, 0
     if len(quantized_candidates) == 1:
         color = quantized_candidates[0]
+        if not use_three_color:
+            if color < 0xFFFF:
+                return color + 1, color
+            return color, color - 1
         return color, color
 
     colors_i16 = colors.astype(np.int16)
