@@ -65,5 +65,6 @@ Details:
 ---
 
 ## Notes (optional)
+- Important takeway (if for bug fix)
 - hypotheses
 - edge cases

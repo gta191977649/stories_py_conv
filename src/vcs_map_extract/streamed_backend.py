@@ -1510,6 +1510,15 @@ def export_streamed_archive(
                 if not set_faces:
                     continue
                 accept_set = False
+                supplemental_hidden_textures = bool(
+                    hidden_only_cluster
+                    and cluster_faces
+                    and set_texture_ref_ids
+                    and (
+                        not cluster_texture_ref_ids
+                        or set_texture_ref_ids.isdisjoint(cluster_texture_ref_ids)
+                    )
+                )
                 if not hidden_only_cluster:
                     accept_set = True
                     if fallback_mode and not cluster_faces:
@@ -1518,7 +1527,7 @@ def export_streamed_archive(
                     accept_set = True
                     if fallback_mode:
                         cluster_recovered_only_from_hidden = True
-                elif set_texture_ref_ids:
+                elif supplemental_hidden_textures:
                     accept_set = True
                 if not accept_set:
                     continue
@@ -1548,8 +1557,6 @@ def export_streamed_archive(
                                 )
                             knackers_textures[texture_name] = merge_texture(existing_knackers, texture) if existing_knackers else texture
                 if not hidden_only_cluster:
-                    break
-                if cluster_texture_ref_ids:
                     break
 
             if cluster_faces:

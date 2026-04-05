@@ -29,3 +29,4 @@ Current tasks:
 - [`/doc/tasks/T002 TXD Packing Quality Gate.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T002%20TXD%20Packing%20Quality%20Gate.md)
 - [`/doc/tasks/T003 Streamed Texture Name Noise Filter.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T003%20Streamed%20Texture%20Name%20Noise%20Filter.md)
 - [`/doc/tasks/T004 Opaque DXT1 Transparent Block Fix.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T004%20Opaque%20DXT1%20Transparent%20Block%20Fix.md)
+- [`/doc/tasks/T005 Hidden Pass Supplemental Streamed Textures.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T005%20Hidden%20Pass%20Supplemental%20Streamed%20Textures.md)
