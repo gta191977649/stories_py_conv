@@ -28,6 +28,22 @@ def write_report(path: Path, report: ReportData) -> None:
         lines.append("<none>")
 
     lines.append("")
+    lines.append("VCS Names Coverage")
+    if report.vcsnames_coverage:
+        for key in sorted(report.vcsnames_coverage):
+            lines.append(f"{key}={report.vcsnames_coverage[key]}")
+    else:
+        lines.append("<none>")
+
+    lines.append("")
+    lines.append("Missing Geometry VCS Names")
+    lines.extend(report.missing_geometry_vcsnames or ["<none>"])
+
+    lines.append("")
+    lines.append("Non-Geometry VCS Names")
+    lines.extend(report.non_geometry_vcsnames or ["<none>"])
+
+    lines.append("")
     lines.append("IPL Diagnostics")
     lines.extend(report.ipl_diagnostics or ["<none>"])
 

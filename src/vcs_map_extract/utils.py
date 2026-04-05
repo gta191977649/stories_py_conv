@@ -4,9 +4,35 @@ import re
 import zlib
 from pathlib import Path
 
+HASH_NAME_RE = re.compile(r"^hash_([0-9A-Fa-f]{8})$")
+
+
+def _recover_common_absolute_path_typos(path: str | Path) -> Path | None:
+    raw = str(path).strip()
+    if not raw:
+        return None
+
+    candidates: list[str] = []
+    if raw.startswith("Users/"):
+        candidates.append(f"/{raw}")
+    if raw.startswith("sers/"):
+        candidates.append(f"/U{raw}")
+    if raw.startswith("ers/"):
+        candidates.append(f"/Us{raw}")
+
+    for candidate in candidates:
+        resolved = Path(candidate).expanduser().resolve()
+        if resolved.exists():
+            return resolved
+    return None
+
 
 def normalize_input_root(path: str | Path) -> Path:
     candidate = Path(path).expanduser().resolve()
+    if not candidate.exists():
+        recovered = _recover_common_absolute_path_typos(path)
+        if recovered is not None:
+            candidate = recovered
     if candidate.is_file():
         return candidate.parent
     return candidate
@@ -29,6 +55,24 @@ def find_sibling_case_insensitive(path: Path, suffix: str) -> Path:
 
 def uppercase_crc32(name: str) -> int:
     return zlib.crc32(name.upper().encode("ascii", "ignore")) & 0xFFFFFFFF
+
+
+def format_hash_name(hash_value: int) -> str:
+    return f"hash_{hash_value & 0xFFFFFFFF:08x}"
+
+
+def parse_hash_name(name: str) -> int | None:
+    match = HASH_NAME_RE.match(name.strip())
+    if match is None:
+        return None
+    return int(match.group(1), 16)
+
+
+def normalize_model_name(name: str) -> str:
+    hash_value = parse_hash_name(name)
+    if hash_value is None:
+        return name
+    return format_hash_name(hash_value)
 
 
 def is_zlib_blob(data: bytes) -> bool:
@@ -54,3 +98,7 @@ def maybe_decompress(data: bytes) -> bytes:
 def sanitize_filename(stem: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
     return sanitized or "unnamed"
+
+
+def model_stem_key(name: str) -> str:
+    return sanitize_filename(normalize_model_name(name)).lower()

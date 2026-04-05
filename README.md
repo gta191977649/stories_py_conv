@@ -2,6 +2,28 @@
 
 Python CLI for extracting GTA VCS PS2 static/map assets into GTA RW-compatible outputs.
 
+## Helper Tools
+
+The repo also includes a streamed-texture extraction helper for decoder checks:
+
+```bash
+cd /Users/nurupo/Desktop/dev/stories_py_conv
+source .venv/bin/activate
+python txd_extract_test.py /Users/nurupo/Desktop/ps2/GAME MAINLA 5057 --quiet
+```
+
+CLI shape:
+
+```text
+python txd_extract_test.py INPUT_ROOT {BEACH|MAINLA|MALL} RES_ID [-o OUTPUT.png] [--quiet]
+```
+
+Example outputs:
+- default output path: `OUTPUT_DEBUG/mainla_5057.png`
+- custom output path via `-o /path/to/output.png`
+
+Use this tool when you need to verify the current streamed texture decoder against a specific `res_id` without running a full export.
+
 ## Install
 
 ```bash
@@ -78,6 +100,8 @@ Options:
   - write exported `.txd` files using DXT compression instead of uncompressed rasters
   - applies to standard archive TXDs, streamed archive TXDs, and the final root `knackers.txd`
   - when omitted, TXDs are written uncompressed as before
+  - opaque textures still pack as `DXT1/RASTER_565` even when a higher DXT level is requested, matching the current `librw` path
+  - textures whose DXT roundtrip is too destructive fall back to uncompressed output instead of being forced through a visibly broken compressed raster
   - mapping:
     - `1` -> DXT1
     - `2` -> DXT2
@@ -284,6 +308,8 @@ IMG WRLD chunk body
 ```
 
 As with geometry, a streamed texture resource can have more than one sector-local overlay variant for the same `resId`. The extractor tries all candidates until one decodes successfully.
+
+For 4-bit streamed textures, decode scoring also tries both nibble orders and swapped width/height header variants when needed. Some streamed blobs are larger than the actual raster payload, so the decoder now uses the header's local raster offset plus the minimal raster block size instead of assuming the palette sits at the end of the whole resource blob. Some real assets also carry all-zero CLUT alpha bytes even though they are meant to be opaque, so the decoder treats that palette case as no-alpha instead of full transparency. This is required for assets such as `BEACH` `res_id=129`, `BEACH` `res_id=1882`, `MAINLA` `res_id=448`, and `MAINLA` `res_id=5291`.
 
 ### How naming works
 
@@ -547,6 +573,8 @@ This prevents one corrupt streamed fragment from causing the whole model export 
 - The required pure-Python helper code is also vendored in this repo, so the tool no longer depends on sibling checkouts of `g3DTZ`, `librwgta`, `BLeeds`, or `DragonFF`.
 - `BEACH`, `MAINLA`, and `MALL` now use a pure-Python streamed exporter with world, interior, and area-resource loading.
 - Streamed neon/light resources are now handled as best-effort geometry too, including small wrapped transparent-pass blobs that only expose position strips.
+- Streamed 4-bit texture decode now handles low/high nibble variants, swapped header dimensions, local raster offsets inside oversized resource blobs, minimal raster block sizing, and all-zero palette-alpha no-alpha cases, which fixes previously empty or corrupted exports such as `beach_129`, `beach_1882`, `mainla_448`, and `mainla_5291`.
+- Opaque exported TXD textures are written as `565` instead of always `8888`, so exported raster metadata matches the decoded texture content more closely.
 - Streamed transform reconstruction now uses exact linked entity anchors from `GAME.dat` when available, both for DFF localization and generated streamed IPL rows.
 - The IPL quaternion conversion now matches the streamed exporter matrix convention; this fixed wrong headings for some anchored models such as `JM_marinex`.
 - Coverage is still best-effort: some streamed resources are malformed, unresolved, or too extreme for DragonFF mesh/collision writers, and those cases are recorded in `report.txt` instead of aborting the run.

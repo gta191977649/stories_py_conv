@@ -203,21 +203,39 @@ def _premultiply_block_rgb(block: np.ndarray) -> np.ndarray:
     return (((rgb * alpha) + 127) // 255).astype(np.uint8)
 
 
-def _select_color_endpoints(block_rgb: np.ndarray) -> tuple[int, int]:
-    colors = block_rgb.reshape(-1, 3).astype(np.int16)
-    if np.all(colors == colors[0]):
-        color = _rgb888_to_565(colors[0])
+def _select_color_endpoints(block_rgb: np.ndarray, *, use_three_color: bool) -> tuple[int, int]:
+    colors = block_rgb.reshape(-1, 3).astype(np.uint8)
+    quantized_candidates = sorted({_rgb888_to_565(color) for color in np.unique(colors, axis=0)})
+    if not quantized_candidates:
+        return 0, 0
+    if len(quantized_candidates) == 1:
+        color = quantized_candidates[0]
+        if not use_three_color:
+            if color < 0xFFFF:
+                return color + 1, color
+            return color, color - 1
         return color, color
 
-    mins = colors.min(axis=0)
-    maxs = colors.max(axis=0)
-    axis = maxs - mins
-    if not np.any(axis):
-        axis = np.array([1, 1, 1], dtype=np.int16)
-    projections = colors @ axis
-    endpoint0 = colors[int(np.argmax(projections))]
-    endpoint1 = colors[int(np.argmin(projections))]
-    return _rgb888_to_565(endpoint0), _rgb888_to_565(endpoint1)
+    colors_i16 = colors.astype(np.int16)
+    best_pair: tuple[int, int] | None = None
+    best_error: int | None = None
+    for candidate0 in quantized_candidates:
+        for candidate1 in quantized_candidates:
+            if use_three_color:
+                color0, color1 = min(candidate0, candidate1), max(candidate0, candidate1)
+            else:
+                color0, color1 = max(candidate0, candidate1), min(candidate0, candidate1)
+            palette = _build_color_palette(color0, color1, use_three_color=use_three_color).astype(np.int16)
+            distances = np.sum((colors_i16[:, None, :] - palette[None, :, :]) ** 2, axis=2)
+            color_slots = 3 if use_three_color else 4
+            error = int(np.min(distances[:, :color_slots], axis=1).sum())
+            pair = (color0, color1)
+            if best_error is None or error < best_error or (error == best_error and pair > best_pair):
+                best_error = error
+                best_pair = pair
+
+    assert best_pair is not None
+    return best_pair
 
 
 def _build_color_palette(color0: int, color1: int, *, use_three_color: bool) -> np.ndarray:
@@ -247,12 +265,8 @@ def _build_color_palette(color0: int, color1: int, *, use_three_color: bool) -> 
 
 
 def _encode_color_block(block_rgb: np.ndarray, *, allow_transparency: bool, alpha: np.ndarray | None = None) -> bytes:
-    color0, color1 = _select_color_endpoints(block_rgb)
     use_three_color = bool(allow_transparency and alpha is not None and np.any(alpha.reshape(-1) < 128))
-    if use_three_color and color0 > color1:
-        color0, color1 = color1, color0
-    if not use_three_color and color0 < color1:
-        color0, color1 = color1, color0
+    color0, color1 = _select_color_endpoints(block_rgb, use_three_color=use_three_color)
 
     palette = _build_color_palette(color0, color1, use_three_color=use_three_color)
     colors = block_rgb.reshape(-1, 3).astype(np.int16)
@@ -356,10 +370,15 @@ def _encode_dxt_texture(texture: DecodedTexture, dxt_level: int) -> bytes:
     return bytes(encoded)
 
 
-def _make_txd_native(texture: DecodedTexture, dxt_level: int | None = None):
+def _effective_dxt_level(texture: DecodedTexture, requested_level: int) -> int:
+    if requested_level == 1 or texture.has_alpha:
+        return requested_level
+    return 1
+
+
+def _make_uncompressed_txd_native(texture: DecodedTexture):
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
     rgba = bytes(texture.rgba)
-    has_alpha = texture.has_alpha
     native = dragon_txd.TextureNative()
     native.platform_id = _dragon_dff.NativePlatformType.D3D9
     native.filter_mode = 0x06
@@ -371,41 +390,13 @@ def _make_txd_native(texture: DecodedTexture, dxt_level: int | None = None):
     native.num_levels = 1
     native.raster_type = 4
     native.platform_properties = SimpleNamespace(
-        alpha=has_alpha,
+        alpha=texture.has_alpha,
         cube_texture=False,
         auto_mipmaps=False,
         compressed=False,
     )
     native.palette = b""
-    if dxt_level is not None:
-        format_by_level = {
-            1: dragon_txd.D3DFormat.D3D_DXT1,
-            2: dragon_txd.D3DFormat.D3D_DXT2,
-            3: dragon_txd.D3DFormat.D3D_DXT3,
-            4: dragon_txd.D3DFormat.D3D_DXT4,
-            5: dragon_txd.D3DFormat.D3D_DXT5,
-        }
-        if dxt_level not in format_by_level:
-            raise ValueError(f"Unsupported DXT level: {dxt_level}")
-        native.platform_properties = SimpleNamespace(
-            alpha=has_alpha,
-            cube_texture=False,
-            auto_mipmaps=False,
-            compressed=True,
-        )
-        if dxt_level == 1:
-            native.raster_format_flags = (
-                dragon_txd.RasterFormat.RASTER_1555 << 8
-                if has_alpha
-                else dragon_txd.RasterFormat.RASTER_565 << 8
-            )
-            native.depth = 16
-        else:
-            native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
-            native.depth = 32
-        native.d3d_format = format_by_level[dxt_level]
-        native.pixels = [_encode_dxt_texture(texture, dxt_level)]
-    elif has_alpha:
+    if texture.has_alpha:
         native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
         native.d3d_format = dragon_txd.D3DFormat.D3D_8888
         native.depth = 32
@@ -416,6 +407,82 @@ def _make_txd_native(texture: DecodedTexture, dxt_level: int | None = None):
         native.depth = 16
         native.pixels = [dragon_txd.ImageEncoder.rgba_to_bgra565(rgba)]
     return native
+
+
+def _make_compressed_txd_native(texture: DecodedTexture, *, dxt_level: int):
+    _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
+    native = dragon_txd.TextureNative()
+    native.platform_id = _dragon_dff.NativePlatformType.D3D9
+    native.filter_mode = 0x06
+    native.uv_addressing = 0b00010001
+    native.name = texture.name
+    native.mask = ""
+    native.width = texture.width
+    native.height = texture.height
+    native.num_levels = 1
+    native.raster_type = 4
+    native.palette = b""
+    native.platform_properties = SimpleNamespace(
+        alpha=texture.has_alpha,
+        cube_texture=False,
+        auto_mipmaps=False,
+        compressed=True,
+    )
+    format_by_level = {
+        1: dragon_txd.D3DFormat.D3D_DXT1,
+        2: dragon_txd.D3DFormat.D3D_DXT2,
+        3: dragon_txd.D3DFormat.D3D_DXT3,
+        4: dragon_txd.D3DFormat.D3D_DXT4,
+        5: dragon_txd.D3DFormat.D3D_DXT5,
+    }
+    if dxt_level == 1:
+        native.raster_format_flags = (
+            dragon_txd.RasterFormat.RASTER_1555 << 8
+            if texture.has_alpha
+            else dragon_txd.RasterFormat.RASTER_565 << 8
+        )
+        native.depth = 16
+    else:
+        native.raster_format_flags = dragon_txd.RasterFormat.RASTER_8888 << 8
+        native.depth = 32
+    native.d3d_format = format_by_level[dxt_level]
+    native.pixels = [_encode_dxt_texture(texture, dxt_level)]
+    return native
+
+
+def _dxt_roundtrip_error(texture: DecodedTexture, native) -> tuple[float, int, float, int]:
+    original = np.frombuffer(texture.rgba, dtype=np.uint8).reshape((texture.height, texture.width, 4))
+    decoded = np.frombuffer(native.to_rgba(), dtype=np.uint8).reshape((texture.height, texture.width, 4))
+    rgb_diff = np.abs(original[:, :, :3].astype(np.int16) - decoded[:, :, :3].astype(np.int16))
+    alpha_diff = np.abs(original[:, :, 3].astype(np.int16) - decoded[:, :, 3].astype(np.int16))
+    return (
+        float(rgb_diff.mean()),
+        int(rgb_diff.max()),
+        float(alpha_diff.mean()),
+        int(alpha_diff.max()),
+    )
+
+
+def _should_keep_compressed_txd(texture: DecodedTexture, native) -> bool:
+    if texture.width % 4 != 0 or texture.height % 4 != 0:
+        return False
+    mean_rgb, max_rgb, mean_alpha, max_alpha = _dxt_roundtrip_error(texture, native)
+    if mean_rgb > 12.0 or max_rgb > 96:
+        return False
+    if texture.has_alpha and (mean_alpha > 12.0 or max_alpha > 96):
+        return False
+    return True
+
+
+def _make_txd_native(texture: DecodedTexture, dxt_level: int | None = None):
+    if dxt_level is not None:
+        if dxt_level not in {1, 2, 3, 4, 5}:
+            raise ValueError(f"Unsupported DXT level: {dxt_level}")
+        effective_level = _effective_dxt_level(texture, dxt_level)
+        native = _make_compressed_txd_native(texture, dxt_level=effective_level)
+        if _should_keep_compressed_txd(texture, native):
+            return native
+    return _make_uncompressed_txd_native(texture)
 
 
 def write_txd_from_decoded_textures(
@@ -552,9 +619,9 @@ def _matrix_to_frame_components(matrix: object):
     rows = tuple(tuple(float(value) for value in row) for row in matrix)
     return (
         dragon_dff.Matrix(
-            dragon_dff.Vector(rows[0][0], rows[1][0], rows[2][0]),
-            dragon_dff.Vector(rows[0][1], rows[1][1], rows[2][1]),
-            dragon_dff.Vector(rows[0][2], rows[1][2], rows[2][2]),
+            dragon_dff.Vector(rows[0][0], rows[0][1], rows[0][2]),
+            dragon_dff.Vector(rows[1][0], rows[1][1], rows[1][2]),
+            dragon_dff.Vector(rows[2][0], rows[2][1], rows[2][2]),
         ),
         dragon_dff.Vector(rows[0][3], rows[1][3], rows[2][3]),
     )
