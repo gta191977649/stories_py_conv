@@ -5,12 +5,15 @@ from functools import lru_cache
 from pathlib import Path
 import shutil
 import struct
+from concurrent.futures import ThreadPoolExecutor
+from os import cpu_count
 from types import SimpleNamespace
 from typing import Callable, Iterable
 
 import numpy as np
 
 from .mathutils_compat import install_mathutils_shim
+from .perf import TimingRecorder
 from .utils import sanitize_filename
 
 
@@ -494,7 +497,12 @@ def write_txd_from_decoded_textures(
     _dragon_dff, dragon_txd, _dragon_col = load_dragonff_modules()
     txd_file = dragon_txd.txd()
     txd_file.device_id = dragon_txd.DeviceType.DEVICE_D3D9
-    txd_file.native_textures = [_make_txd_native(texture, dxt_level=dxt_level) for texture in textures]
+    if len(textures) > 1:
+        max_workers = min(len(textures), max(1, min(8, cpu_count() or 1)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            txd_file.native_textures = list(executor.map(lambda texture: _make_txd_native(texture, dxt_level=dxt_level), textures))
+    else:
+        txd_file.native_textures = [_make_txd_native(texture, dxt_level=dxt_level) for texture in textures]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(txd_file.write_memory(RW_VERSION))
     return [texture.name for texture in textures]
@@ -1600,6 +1608,7 @@ def run_conversion_jobs(
     log: Callable[[str], None] | None = print,
     log_success: bool = True,
     on_job_done: Callable[[dict[str, str], dict[str, object]], None] | None = None,
+    timings: TimingRecorder | None = None,
 ) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for job in jobs:
@@ -1616,16 +1625,30 @@ def run_conversion_jobs(
                 "output": str(output_path),
                 "ok": True,
             }
-            if job["type"] == "mdl":
-                write_dff(input_path, output_path)
-            elif job["type"] == "tex":
-                result["texture_names"] = write_txd(input_path, output_path, dxt_level=dxt_level)
-            elif job["type"] == "col2":
-                result["models"] = write_col(input_path, output_path)
-            elif job["type"] == "raw":
-                shutil.copyfile(input_path, output_path)
+            timing_name = f"standard.convert.{job['type']}"
+            if timings is not None:
+                with timings.timed(timing_name):
+                    if job["type"] == "mdl":
+                        write_dff(input_path, output_path)
+                    elif job["type"] == "tex":
+                        result["texture_names"] = write_txd(input_path, output_path, dxt_level=dxt_level)
+                    elif job["type"] == "col2":
+                        result["models"] = write_col(input_path, output_path)
+                    elif job["type"] == "raw":
+                        shutil.copyfile(input_path, output_path)
+                    else:
+                        raise ValueError(f"Unsupported job type: {job['type']}")
             else:
-                raise ValueError(f"Unsupported job type: {job['type']}")
+                if job["type"] == "mdl":
+                    write_dff(input_path, output_path)
+                elif job["type"] == "tex":
+                    result["texture_names"] = write_txd(input_path, output_path, dxt_level=dxt_level)
+                elif job["type"] == "col2":
+                    result["models"] = write_col(input_path, output_path)
+                elif job["type"] == "raw":
+                    shutil.copyfile(input_path, output_path)
+                else:
+                    raise ValueError(f"Unsupported job type: {job['type']}")
         except Exception as exc:  # pragma: no cover - exercised by live data failures
             if log is not None:
                 log(f"[convert] FAILED {job['archive']} {job['type']} {input_path.name}: {exc}")

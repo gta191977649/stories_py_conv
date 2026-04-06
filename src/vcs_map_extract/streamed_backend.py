@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 import struct
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -11,6 +12,7 @@ from typing import Callable
 import numpy as np
 
 from .models import ReportData, StreamedArchivePlan, StreamedPlacement
+from .perf import TimingRecorder
 from .pure_backend import DecodedTexture, MeshData, write_col_from_mesh, write_dff_from_mesh, write_txd_from_decoded_textures
 from .reference_data import load_vcs_name_table
 from .streamed_world import LevelChunk, parse_area_resource_table
@@ -119,12 +121,24 @@ class ResourceBlobVariant:
     provenance: str
     blob: bytes
     raw_address: int | None = None
+    signature: tuple[int, str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "signature", _blob_signature(self.blob))
 
 
 @dataclass(slots=True)
 class DecodedResourceVariant:
     variant: ResourceBlobVariant
     geometry: ParsedStreamedGeometry
+
+
+@dataclass(slots=True)
+class DecodedTexturePayload:
+    rgba: bytes
+    width: int
+    height: int
+    has_alpha: bool
 
 
 def _nearly_equal(a: float, b: float, eps: float = 1e-6) -> bool:
@@ -202,13 +216,8 @@ def _blob_signature(blob: bytes) -> tuple[int, str]:
     return (len(blob), hashlib.sha1(blob).hexdigest())
 
 
-def _variant_cache_key(variant: ResourceBlobVariant) -> tuple[int, str, int, str]:
-    return (
-        int(variant.res_id),
-        variant.origin,
-        len(variant.blob),
-        hashlib.sha1(variant.blob[:256]).hexdigest(),
-    )
+def _variant_cache_key(variant: ResourceBlobVariant) -> tuple[int, str]:
+    return variant.signature
 
 
 def _vertex_bounds_signature(vertices: list[tuple[float, float, float]]) -> tuple[float, ...]:
@@ -224,8 +233,20 @@ def _vertex_bounds_signature(vertices: list[tuple[float, float, float]]) -> tupl
     return tuple(round(value, 4) for value in (*mins, *maxs))
 
 
+def _vertex_array_bounds_signature(vertex_array: np.ndarray) -> tuple[float, ...]:
+    mins = vertex_array.min(axis=0)
+    maxs = vertex_array.max(axis=0)
+    return tuple(round(float(value), 4) for value in (*mins.tolist(), *maxs.tolist()))
+
+
 def _matrix_signature(matrix: np.ndarray) -> tuple[float, ...]:
     return tuple(round(float(value), 4) for value in matrix.reshape(-1))
+
+
+def _transform_vertex_array(matrix: np.ndarray, vertex_array: np.ndarray) -> np.ndarray:
+    linear = matrix[:3, :3]
+    translation = matrix[:3, 3]
+    return (vertex_array @ linear.T) + translation
 
 
 def _variant_sort_key(variant: ResourceBlobVariant) -> tuple[int, int, str]:
@@ -411,7 +432,10 @@ class LVZArchive:
         self.known_hash_names = load_vcs_name_table()
         self.known_names = {name.lower(): name for name in self.known_hash_names.values()}
         self.texture_cache: dict[int, DecodedTexture | None] = {}
-        self.geometry_cache: dict[tuple[int, str, int, str], ParsedStreamedGeometry | None] = {}
+        self.texture_variant_cache: dict[tuple[tuple[int, str], int | None], DecodedTexturePayload | None] = {}
+        self.geometry_cache: dict[tuple[int, str], ParsedStreamedGeometry | None] = {}
+        self.resource_variant_cache: dict[int, list[ResourceBlobVariant]] = {}
+        self.decoded_variant_cache: dict[int, list[DecodedResourceVariant]] = {}
 
     def _append_unique_variant(
         self,
@@ -489,11 +513,19 @@ class LVZArchive:
         return resources
 
     def resource_variants_for_res_id(self, res_id: int) -> list[ResourceBlobVariant]:
+        cache = getattr(self, "resource_variant_cache", None)
+        if cache is None:
+            cache = {}
+            self.resource_variant_cache = cache
+        cached = cache.get(res_id)
+        if cached is not None:
+            return cached
         candidates: list[ResourceBlobVariant] = []
         candidates.extend(self.area_variants_by_res_id.get(res_id, []))
         candidates.extend(self.master_variants_by_res_id.get(res_id, []))
         candidates.extend(self.overlay_variants_by_res_id.get(res_id, []))
         candidates.sort(key=_variant_sort_key)
+        cache[res_id] = candidates
         return candidates
 
     def resource_blobs_for_res_id(self, res_id: int) -> list[tuple[bytes, str]]:
@@ -528,19 +560,17 @@ class LVZArchive:
             return f"tex_{level_id}_{res_id:04x}", "synthetic"
         return f"{self.archive_name.lower()}_{res_id}", "synthetic"
 
-    def _decode_texture_blob(
+    def _decode_texture_payload(
         self,
         blob: bytes,
-        res_id: int,
-        origin: str,
         *,
         raw_address: int | None = None,
-    ) -> tuple[DecodedTexture | None, str]:
+    ) -> DecodedTexturePayload | None:
         if len(blob) < 16:
-            return None, "synthetic"
+            return None
         parsed = parse_ps2_header((b"\x00" * 16) + blob, 16)
         if parsed is None:
-            return None, "synthetic"
+            return None
         raster_offset = 16
         if raw_address is not None:
             candidate_offset = parsed.raster_offset - raw_address
@@ -552,12 +582,11 @@ class LVZArchive:
             raster_offset=raster_offset,
             flags=parsed.flags,
         )
-        name, naming_mode = self._recover_texture_name(blob, res_id)
         palette_bytes = 16 * 4 if header.bpp == 4 else 256 * 4 if header.bpp == 8 else 0
         base_bytes = max(0, ((header.width * header.height * header.bpp) + 7) // 8)
         block_size = min(len(blob) - raster_offset, max(base_bytes + palette_bytes, 0))
         if block_size <= 0:
-            return None, naming_mode
+            return None
 
         header_variants: list[Ps2TexHeader] = [_make_ps2_header_variant(header)]
         if header.width != header.height:
@@ -597,14 +626,33 @@ class LVZArchive:
                     best_score = score
                     best_rgba = rgba
         if best_rgba is None:
+            return None
+        return DecodedTexturePayload(
+            rgba=best_rgba.astype(np.uint8).tobytes(),
+            width=int(best_rgba.shape[1]),
+            height=int(best_rgba.shape[0]),
+            has_alpha=bool(np.any(best_rgba[:, :, 3] < 255)),
+        )
+
+    def _decode_texture_blob(
+        self,
+        blob: bytes,
+        res_id: int,
+        origin: str,
+        *,
+        raw_address: int | None = None,
+    ) -> tuple[DecodedTexture | None, str]:
+        payload = self._decode_texture_payload(blob, raw_address=raw_address)
+        name, naming_mode = self._recover_texture_name(blob, res_id)
+        if payload is None:
             return None, naming_mode
         return (
             DecodedTexture(
                 name=name,
-                rgba=best_rgba.astype(np.uint8).tobytes(),
-                width=int(best_rgba.shape[1]),
-                height=int(best_rgba.shape[0]),
-                has_alpha=bool(np.any(best_rgba[:, :, 3] < 255)),
+                rgba=payload.rgba,
+                width=payload.width,
+                height=payload.height,
+                has_alpha=payload.has_alpha,
             ),
             naming_mode,
         )
@@ -613,11 +661,23 @@ class LVZArchive:
         if res_id not in self.texture_cache:
             decoded = None
             for variant in self.resource_variants_for_res_id(res_id):
-                decoded, _naming_mode = self._decode_texture_blob(
-                    variant.blob,
-                    res_id,
-                    variant.origin,
-                    raw_address=variant.raw_address,
+                cache_key = (variant.signature, variant.raw_address)
+                payload = self.texture_variant_cache.get(cache_key)
+                if payload is None and cache_key not in self.texture_variant_cache:
+                    payload = self._decode_texture_payload(
+                        variant.blob,
+                        raw_address=variant.raw_address,
+                    )
+                    self.texture_variant_cache[cache_key] = payload
+                if payload is None:
+                    continue
+                name, _naming_mode = self._recover_texture_name(variant.blob, res_id)
+                decoded = DecodedTexture(
+                    name=name,
+                    rgba=payload.rgba,
+                    width=payload.width,
+                    height=payload.height,
+                    has_alpha=payload.has_alpha,
                 )
                 if decoded is not None:
                     break
@@ -1046,12 +1106,20 @@ class LVZArchive:
         return geometry
 
     def decoded_variants_for_res_id(self, res_id: int) -> list[DecodedResourceVariant]:
+        cache = getattr(self, "decoded_variant_cache", None)
+        if cache is None:
+            cache = {}
+            self.decoded_variant_cache = cache
+        cached = cache.get(res_id)
+        if cached is not None:
+            return cached
         decoded: list[DecodedResourceVariant] = []
         for variant in self.resource_variants_for_res_id(res_id):
             geometry = self.geometry_for_variant(variant)
             if geometry is None:
                 continue
             decoded.append(DecodedResourceVariant(variant=variant, geometry=geometry))
+        cache[res_id] = decoded
         return decoded
 
     def geometry_for_res_id(self, res_id: int) -> ParsedStreamedGeometry | None:
@@ -1288,9 +1356,17 @@ def export_streamed_archive(
     global_knackers_textures: dict[str, DecodedTexture] | None = None,
     ipl_summary=None,
     on_model_done: Callable[[str, StreamedModelPlan, bool], None] | None = None,
+    timings: TimingRecorder | None = None,
 ) -> dict[str, int]:
     _log(f"[streamed] load {archive_name}.LVZ")
-    archive = LVZArchive(archive_name, root=root, level=getattr(plan, "preloaded_level", None))
+    load_timer = timings.timed(f"streamed.export.{archive_name.lower()}.load_archive") if timings is not None else None
+    if load_timer is not None:
+        load_timer.__enter__()
+    try:
+        archive = LVZArchive(archive_name, root=root, level=getattr(plan, "preloaded_level", None))
+    finally:
+        if load_timer is not None:
+            load_timer.__exit__(None, None, None)
     archive_dir = output_root / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1314,346 +1390,357 @@ def export_streamed_archive(
     interior_unresolved_skips = 0
     exported_output_names: set[str] = set()
 
-    for model in plan.model_exports:
-        output_stem = sanitize_filename(model.output_name or model.model_name)
-        if model.export_kind.startswith("interior") and model.unresolved_name:
-            interior_unresolved_skips += 1
-            report.interior_diagnostics.append(
-                f"{archive_name}: skipped {model.output_name}: no IDE model name was resolved"
-            )
-            if on_model_done is not None:
-                on_model_done(archive_name, model, False)
-            continue
-        if model.export_kind.startswith("interior") and output_stem in exported_output_names:
-            interior_conflict_skips += 1
-            report.interior_diagnostics.append(
-                f"{archive_name}: skipped {model.output_name}: canonical output name {output_stem} was already exported"
-            )
-            if on_model_done is not None:
-                on_model_done(archive_name, model, False)
-            continue
-        if not model.placements:
-            if on_model_done is not None:
-                on_model_done(archive_name, model, False)
-            continue
-        clusters_consistent, cluster_signatures = _model_clusters_are_consistent(model, ipl_summary=ipl_summary)
-        cluster_sets = _cluster_sets_for_model(model)
-        total_candidate_res_ids = sum(len(cluster) for cluster in cluster_sets)
-        if not clusters_consistent:
-            summary = ", ".join(
-                f"cluster {cluster_index}: {len(signature)} localized transform(s)"
-                for cluster_index, signature in cluster_signatures
-            )
-            report.streamed_diagnostics.append(
-                f"{archive_name}: {model.output_name} has alternate placement cluster disagreement after localization ({summary}); trying primary cluster first"
-            )
-        _log(
-            f"[streamed] {archive_name} model {model.model_name}: "
-            f"{total_candidate_res_ids} resource candidates"
-        )
-        visible_placements = [placement for placement in model.placements if placement.visible]
-        hidden_placements = [placement for placement in model.placements if not placement.visible]
-        vertices: list[tuple[float, float, float]] = []
-        faces: list[tuple[int, int, int]] = []
-        uvs: list[tuple[float, float]] = []
-        face_materials: list[str] = []
-        used_resource_origins: set[str] = set()
-        used_source_kinds: set[str] = set()
-        recovered_only_from_hidden = False
-        bad_fragments_for_model = 0
-        reported_multi_variant_res_ids: set[int] = set()
-        vertex_colors: list[tuple[int, int, int, int]] = []
-        exported_cluster_index = 0
-        for cluster_index, cluster_placements in enumerate(cluster_sets):
-            cluster_visible_placements = [placement for placement in cluster_placements if placement.visible]
-            cluster_hidden_placements = [placement for placement in cluster_placements if not placement.visible]
-            hidden_only_cluster = not cluster_visible_placements
-            cluster_eval_placements = cluster_visible_placements or cluster_hidden_placements
-            placement_sets = _cluster_export_sets(cluster_placements)
-
-            cluster_vertices: list[tuple[float, float, float]] = []
-            cluster_faces: list[tuple[int, int, int]] = []
-            cluster_uvs: list[tuple[float, float]] = []
-            cluster_face_materials: list[str] = []
-            cluster_vertex_colors: list[tuple[int, int, int, int]] = []
-            cluster_seen_fragments: set[tuple[int, int, int]] = set()
-            cluster_used_resource_origins: set[str] = set()
-            cluster_used_source_kinds: set[str] = set()
-            cluster_texture_ref_ids: set[int] = set()
-            cluster_recovered_only_from_hidden = False
-            localized_bounds_counts_by_res_id: dict[int, dict[tuple[float, ...], int]] = {}
-
-            base_inverse, base_placement = choose_base_transform(cluster_eval_placements)
-            if base_placement is None:
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: all placement matrices for {model.model_name} were degenerate; used identity fallback"
+    with timings.timed(f"streamed.export.{archive_name.lower()}.models") if timings is not None else nullcontext():
+        for model in plan.model_exports:
+            output_stem = sanitize_filename(model.output_name or model.model_name)
+            if model.export_kind.startswith("interior") and model.unresolved_name:
+                interior_unresolved_skips += 1
+                report.interior_diagnostics.append(
+                    f"{archive_name}: skipped {model.output_name}: no IDE model name was resolved"
                 )
-            elif base_placement is not cluster_eval_placements[0]:
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: skipped degenerate base placement for {model.model_name}; "
-                    f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
+                if on_model_done is not None:
+                    on_model_done(archive_name, model, False)
+                continue
+            if model.export_kind.startswith("interior") and output_stem in exported_output_names:
+                interior_conflict_skips += 1
+                report.interior_diagnostics.append(
+                    f"{archive_name}: skipped {model.output_name}: canonical output name {output_stem} was already exported"
                 )
-            exact_inverse, exact_linked_id = _resolve_single_linked_inverse(cluster_eval_placements, ipl_summary)
-            if exact_inverse is not None:
-                base_inverse = exact_inverse
-                if model.export_kind.startswith("interior"):
-                    report.interior_diagnostics.append(
-                        f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
-                    )
-                else:
+                if on_model_done is not None:
+                    on_model_done(archive_name, model, False)
+                continue
+            if not model.placements:
+                if on_model_done is not None:
+                    on_model_done(archive_name, model, False)
+                continue
+            clusters_consistent, cluster_signatures = _model_clusters_are_consistent(model, ipl_summary=ipl_summary)
+            cluster_sets = _cluster_sets_for_model(model)
+            total_candidate_res_ids = sum(len(cluster) for cluster in cluster_sets)
+            if not clusters_consistent:
+                summary = ", ".join(
+                    f"cluster {cluster_index}: {len(signature)} localized transform(s)"
+                    for cluster_index, signature in cluster_signatures
+                )
+                report.streamed_diagnostics.append(
+                    f"{archive_name}: {model.output_name} has alternate placement cluster disagreement after localization ({summary}); trying primary cluster first"
+                )
+            _log(
+                f"[streamed] {archive_name} model {model.model_name}: "
+                f"{total_candidate_res_ids} resource candidates"
+            )
+            visible_placements = [placement for placement in model.placements if placement.visible]
+            hidden_placements = [placement for placement in model.placements if not placement.visible]
+            vertices: list[tuple[float, float, float]] = []
+            faces: list[tuple[int, int, int]] = []
+            uvs: list[tuple[float, float]] = []
+            face_materials: list[str] = []
+            used_resource_origins: set[str] = set()
+            used_source_kinds: set[str] = set()
+            recovered_only_from_hidden = False
+            bad_fragments_for_model = 0
+            reported_multi_variant_res_ids: set[int] = set()
+            vertex_colors: list[tuple[int, int, int, int]] = []
+            exported_cluster_index = 0
+            for cluster_index, cluster_placements in enumerate(cluster_sets):
+                cluster_visible_placements = [placement for placement in cluster_placements if placement.visible]
+                cluster_hidden_placements = [placement for placement in cluster_placements if not placement.visible]
+                hidden_only_cluster = not cluster_visible_placements
+                cluster_eval_placements = cluster_visible_placements or cluster_hidden_placements
+                placement_sets = _cluster_export_sets(cluster_placements)
+
+                cluster_vertices: list[tuple[float, float, float]] = []
+                cluster_faces: list[tuple[int, int, int]] = []
+                cluster_uvs: list[tuple[float, float]] = []
+                cluster_face_materials: list[str] = []
+                cluster_vertex_colors: list[tuple[int, int, int, int]] = []
+                cluster_seen_fragments: set[tuple[int, int, int]] = set()
+                cluster_used_resource_origins: set[str] = set()
+                cluster_used_source_kinds: set[str] = set()
+                cluster_texture_ref_ids: set[int] = set()
+                cluster_recovered_only_from_hidden = False
+                localized_bounds_counts_by_res_id: dict[int, dict[tuple[float, ...], int]] = {}
+
+                base_inverse, base_placement = choose_base_transform(cluster_eval_placements)
+                if base_placement is None:
                     report.streamed_diagnostics.append(
-                        f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
+                        f"{archive_name}: all placement matrices for {model.model_name} were degenerate; used identity fallback"
                     )
+                elif base_placement is not cluster_eval_placements[0]:
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: skipped degenerate base placement for {model.model_name}; "
+                        f"used res_id={base_placement.res_id} from sector={base_placement.sector_id}"
+                    )
+                exact_inverse, exact_linked_id = _resolve_single_linked_inverse(cluster_eval_placements, ipl_summary)
+                if exact_inverse is not None:
+                    base_inverse = exact_inverse
+                    if model.export_kind.startswith("interior"):
+                        report.interior_diagnostics.append(
+                            f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
+                        )
+                    else:
+                        report.streamed_diagnostics.append(
+                            f"{archive_name}: {model.output_name} used exact linked entity 0x{exact_linked_id:X} transform"
+                        )
 
-            for set_index, placements in enumerate(placement_sets):
-                fallback_mode = set_index > 0
-                set_vertices: list[tuple[float, float, float]] = []
-                set_faces: list[tuple[int, int, int]] = []
-                set_uvs: list[tuple[float, float]] = []
-                set_face_materials: list[str] = []
-                set_vertex_colors: list[tuple[int, int, int, int]] = []
-                set_used_resource_origins: set[str] = set()
-                set_used_source_kinds: set[str] = set()
-                set_fragment_keys: set[tuple[int, int, int]] = set()
-                set_texture_ref_ids: set[int] = set()
-                set_textures: list[tuple[str, DecodedTexture]] = []
-                for placement in placements:
-                    raw_variants = archive.resource_variants_for_res_id(placement.res_id)
-                    if not raw_variants:
-                        no_resource_res_ids += 1
-                        missing_res_ids += 1
-                        continue
-                    try:
-                        decoded_variants = archive.decoded_variants_for_res_id(placement.res_id)
-                    except Exception:
-                        decoded_variants = []
-                    if not decoded_variants:
-                        decode_failed_res_ids += 1
-                        missing_res_ids += 1
-                        continue
-                    local_matrix = base_inverse @ rw_matrix(placement.matrix)
-                    candidate_rows: list[
-                        tuple[int, int, int, int, DecodedResourceVariant, list[tuple[float, float, float]], tuple[float, ...]]
-                    ] = []
-                    decoded_signatures: set[tuple[str, tuple[float, ...]]] = set()
-                    signature_counts = localized_bounds_counts_by_res_id.setdefault(placement.res_id, {})
-                    dominant_signature = None
-                    dominant_count = 0
-                    for signature, count in signature_counts.items():
-                        if count > dominant_count:
-                            dominant_signature = signature
-                            dominant_count = count
-                    for decoded_variant in decoded_variants:
-                        transformed_vertices = [
-                            transform_point(local_matrix, vertex)
-                            for vertex in decoded_variant.geometry.vertices
-                        ]
-                        if not _fragment_vertices_valid(transformed_vertices):
+                for set_index, placements in enumerate(placement_sets):
+                    fallback_mode = set_index > 0
+                    set_vertices: list[tuple[float, float, float]] = []
+                    set_faces: list[tuple[int, int, int]] = []
+                    set_uvs: list[tuple[float, float]] = []
+                    set_face_materials: list[str] = []
+                    set_vertex_colors: list[tuple[int, int, int, int]] = []
+                    set_used_resource_origins: set[str] = set()
+                    set_used_source_kinds: set[str] = set()
+                    set_fragment_keys: set[tuple[int, int, int]] = set()
+                    set_texture_ref_ids: set[int] = set()
+                    set_textures: list[tuple[str, DecodedTexture]] = []
+                    for placement in placements:
+                        raw_variants = archive.resource_variants_for_res_id(placement.res_id)
+                        if not raw_variants:
+                            no_resource_res_ids += 1
+                            missing_res_ids += 1
                             continue
-                        bounds_signature = _vertex_bounds_signature(transformed_vertices)
-                        decoded_signatures.add((decoded_variant.variant.origin, bounds_signature))
-                        candidate_rows.append(
-                            (
-                                1 if dominant_signature is not None and bounds_signature == dominant_signature else 0,
-                                -RESOURCE_ORIGIN_PRIORITY.get(decoded_variant.variant.origin, 99),
-                                len(decoded_variant.geometry.faces),
-                                len(decoded_variant.geometry.vertices),
-                                decoded_variant,
-                                transformed_vertices,
-                                bounds_signature,
-                            )
-                        )
-                    if len(decoded_signatures) > 1 and placement.res_id not in reported_multi_variant_res_ids:
-                        reported_multi_variant_res_ids.add(placement.res_id)
-                        report.streamed_diagnostics.append(
-                            f"{archive_name}: {model.model_name} res_id={placement.res_id} has {len(decoded_signatures)} decoded streamed variants"
-                        )
-                    if not candidate_rows:
-                        skipped_bad_fragments += 1
-                        bad_fragments_for_model += 1
-                        report.streamed_diagnostics.append(
-                            f"{archive_name}: skipped corrupt fragment for {model.model_name} "
-                            f"(res_id={placement.res_id}, sector={placement.sector_id}, pass={placement.pass_index}, "
-                            f"source={placement.source_kind})"
-                        )
-                        continue
-                    _match_dominant, _origin_rank, _face_count, _vert_count, selected_variant, transformed_vertices, bounds_signature = max(
-                        candidate_rows,
-                        key=lambda item: (item[0], item[1], item[2], item[3]),
-                    )
-                    signature_counts[bounds_signature] = signature_counts.get(bounds_signature, 0) + 1
-                    geometry = selected_variant.geometry
-                    fragment_key = (
-                        placement.res_id,
-                        *_variant_cache_key(selected_variant.variant),
-                        *bounds_signature,
-                    )
-                    if fragment_key in cluster_seen_fragments or fragment_key in set_fragment_keys:
-                        continue
-                    set_fragment_keys.add(fragment_key)
-                    base_index = len(set_vertices)
-                    set_vertices.extend(transformed_vertices)
-                    set_uvs.extend(geometry.uvs)
-                    set_vertex_colors.extend(geometry.vertex_colors)
-                    set_used_resource_origins.add(geometry.resource_origin)
-                    set_used_source_kinds.add(placement.source_kind)
-                    for face_index, (a, b, c) in enumerate(geometry.faces):
-                        set_faces.append((base_index + a, base_index + b, base_index + c))
-                        texture_res_id = geometry.face_texture_res_ids[face_index]
-                        if texture_res_id >= 0:
-                            set_texture_ref_ids.add(texture_res_id)
-                        texture = _unwrap_texture_result(archive.texture_for_res_id(texture_res_id)) if texture_res_id >= 0 else None
-                        texture_name = texture.name if texture is not None else ""
-                        set_face_materials.append(texture_name)
-                        if texture is not None and model.txd_name:
-                            set_textures.append((texture_name, texture))
-                if not set_faces:
-                    continue
-                accept_set = False
-                supplemental_hidden_textures = bool(
-                    hidden_only_cluster
-                    and cluster_faces
-                    and set_texture_ref_ids
-                    and (
-                        not cluster_texture_ref_ids
-                        or set_texture_ref_ids.isdisjoint(cluster_texture_ref_ids)
-                    )
-                )
-                if not hidden_only_cluster:
-                    accept_set = True
-                    if fallback_mode and not cluster_faces:
-                        cluster_recovered_only_from_hidden = True
-                elif not cluster_faces:
-                    accept_set = True
-                    if fallback_mode:
-                        cluster_recovered_only_from_hidden = True
-                elif supplemental_hidden_textures:
-                    accept_set = True
-                if not accept_set:
-                    continue
-                cluster_seen_fragments.update(set_fragment_keys)
-                base_offset = len(cluster_vertices)
-                cluster_vertices.extend(set_vertices)
-                cluster_uvs.extend(set_uvs)
-                cluster_vertex_colors.extend(set_vertex_colors)
-                cluster_used_resource_origins.update(set_used_resource_origins)
-                cluster_used_source_kinds.update(set_used_source_kinds)
-                cluster_texture_ref_ids.update(set_texture_ref_ids)
-                cluster_faces.extend(
-                    (base_offset + a, base_offset + b, base_offset + c)
-                    for a, b, c in set_faces
-                )
-                cluster_face_materials.extend(set_face_materials)
-                if model.txd_name:
-                    txd_bucket = textures_by_txd.setdefault(model.txd_name, {})
-                    for texture_name, texture in set_textures:
-                        existing = txd_bucket.get(texture_name)
-                        txd_bucket[texture_name] = merge_texture(existing, texture) if existing else texture
-                        if model.txd_name.lower() == "knackers":
-                            existing_knackers = knackers_textures.get(texture_name)
-                            if existing_knackers is not None and existing_knackers.rgba != texture.rgba:
-                                report.knackers_texture_conflicts.append(
-                                    f"{archive_name}: texture '{texture_name}' had conflicting data; kept higher-resolution copy"
+                        try:
+                            decoded_variants = archive.decoded_variants_for_res_id(placement.res_id)
+                        except Exception:
+                            decoded_variants = []
+                        if not decoded_variants:
+                            decode_failed_res_ids += 1
+                            missing_res_ids += 1
+                            continue
+                        local_matrix = base_inverse @ rw_matrix(placement.matrix)
+                        candidate_rows: list[
+                            tuple[int, int, int, int, DecodedResourceVariant, np.ndarray, tuple[float, ...]]
+                        ] = []
+                        decoded_signatures: set[tuple[str, tuple[float, ...]]] = set()
+                        signature_counts = localized_bounds_counts_by_res_id.setdefault(placement.res_id, {})
+                        dominant_signature = None
+                        dominant_count = 0
+                        for signature, count in signature_counts.items():
+                            if count > dominant_count:
+                                dominant_signature = signature
+                                dominant_count = count
+                        for decoded_variant in decoded_variants:
+                            transformed_vertex_array = _transform_vertex_array(local_matrix, decoded_variant.geometry.vertex_array)
+                            if not _fragment_vertex_array_valid(transformed_vertex_array):
+                                continue
+                            bounds_signature = _vertex_array_bounds_signature(transformed_vertex_array)
+                            decoded_signatures.add((decoded_variant.variant.origin, bounds_signature))
+                            candidate_rows.append(
+                                (
+                                    1 if dominant_signature is not None and bounds_signature == dominant_signature else 0,
+                                    -RESOURCE_ORIGIN_PRIORITY.get(decoded_variant.variant.origin, 99),
+                                    len(decoded_variant.geometry.faces),
+                                    len(decoded_variant.geometry.vertices),
+                                    decoded_variant,
+                                    transformed_vertex_array,
+                                    bounds_signature,
                                 )
-                            knackers_textures[texture_name] = merge_texture(existing_knackers, texture) if existing_knackers else texture
-                if not hidden_only_cluster:
+                            )
+                        if len(decoded_signatures) > 1 and placement.res_id not in reported_multi_variant_res_ids:
+                            reported_multi_variant_res_ids.add(placement.res_id)
+                            report.streamed_diagnostics.append(
+                                f"{archive_name}: {model.model_name} res_id={placement.res_id} has {len(decoded_signatures)} decoded streamed variants"
+                            )
+                        if not candidate_rows:
+                            skipped_bad_fragments += 1
+                            bad_fragments_for_model += 1
+                            report.streamed_diagnostics.append(
+                                f"{archive_name}: skipped corrupt fragment for {model.model_name} "
+                                f"(res_id={placement.res_id}, sector={placement.sector_id}, pass={placement.pass_index}, "
+                                f"source={placement.source_kind})"
+                            )
+                            continue
+                        _match_dominant, _origin_rank, _face_count, _vert_count, selected_variant, transformed_vertex_array, bounds_signature = max(
+                            candidate_rows,
+                            key=lambda item: (item[0], item[1], item[2], item[3]),
+                        )
+                        signature_counts[bounds_signature] = signature_counts.get(bounds_signature, 0) + 1
+                        geometry = selected_variant.geometry
+                        fragment_key = (
+                            placement.res_id,
+                            *_variant_cache_key(selected_variant.variant),
+                            *bounds_signature,
+                        )
+                        if fragment_key in cluster_seen_fragments or fragment_key in set_fragment_keys:
+                            continue
+                        set_fragment_keys.add(fragment_key)
+                        base_index = len(set_vertices)
+                        transformed_vertices = [tuple(vertex) for vertex in transformed_vertex_array.tolist()]
+                        set_vertices.extend(transformed_vertices)
+                        set_uvs.extend(geometry.uvs)
+                        set_vertex_colors.extend(geometry.vertex_colors)
+                        set_used_resource_origins.add(geometry.resource_origin)
+                        set_used_source_kinds.add(placement.source_kind)
+                        resolved_textures_by_res_id: dict[int, DecodedTexture] = {}
+                        resolved_texture_names_by_res_id: dict[int, str] = {}
+                        for texture_res_id in geometry.unique_texture_res_ids:
+                            texture = _unwrap_texture_result(archive.texture_for_res_id(texture_res_id))
+                            if texture is None:
+                                continue
+                            resolved_textures_by_res_id[texture_res_id] = texture
+                            resolved_texture_names_by_res_id[texture_res_id] = texture.name
+                            if model.txd_name:
+                                set_textures.append((texture.name, texture))
+                        set_texture_ref_ids.update(geometry.unique_texture_res_ids)
+                        for face_index, (a, b, c) in enumerate(geometry.faces):
+                            set_faces.append((base_index + a, base_index + b, base_index + c))
+                            texture_res_id = geometry.face_texture_res_ids[face_index]
+                            set_face_materials.append(resolved_texture_names_by_res_id.get(texture_res_id, ""))
+                    if not set_faces:
+                        continue
+                    accept_set = False
+                    supplemental_hidden_textures = bool(
+                        hidden_only_cluster
+                        and cluster_faces
+                        and set_texture_ref_ids
+                        and (
+                            not cluster_texture_ref_ids
+                            or set_texture_ref_ids.isdisjoint(cluster_texture_ref_ids)
+                        )
+                    )
+                    if not hidden_only_cluster:
+                        accept_set = True
+                        if fallback_mode and not cluster_faces:
+                            cluster_recovered_only_from_hidden = True
+                    elif not cluster_faces:
+                        accept_set = True
+                        if fallback_mode:
+                            cluster_recovered_only_from_hidden = True
+                    elif supplemental_hidden_textures:
+                        accept_set = True
+                    if not accept_set:
+                        continue
+                    cluster_seen_fragments.update(set_fragment_keys)
+                    base_offset = len(cluster_vertices)
+                    cluster_vertices.extend(set_vertices)
+                    cluster_uvs.extend(set_uvs)
+                    cluster_vertex_colors.extend(set_vertex_colors)
+                    cluster_used_resource_origins.update(set_used_resource_origins)
+                    cluster_used_source_kinds.update(set_used_source_kinds)
+                    cluster_texture_ref_ids.update(set_texture_ref_ids)
+                    cluster_faces.extend(
+                        (base_offset + a, base_offset + b, base_offset + c)
+                        for a, b, c in set_faces
+                    )
+                    cluster_face_materials.extend(set_face_materials)
+                    if model.txd_name:
+                        txd_bucket = textures_by_txd.setdefault(model.txd_name, {})
+                        for texture_name, texture in set_textures:
+                            existing = txd_bucket.get(texture_name)
+                            txd_bucket[texture_name] = merge_texture(existing, texture) if existing else texture
+                            if model.txd_name.lower() == "knackers":
+                                existing_knackers = knackers_textures.get(texture_name)
+                                if existing_knackers is not None and existing_knackers.rgba != texture.rgba:
+                                    report.knackers_texture_conflicts.append(
+                                        f"{archive_name}: texture '{texture_name}' had conflicting data; kept higher-resolution copy"
+                                    )
+                                knackers_textures[texture_name] = merge_texture(existing_knackers, texture) if existing_knackers else texture
+                    if not hidden_only_cluster:
+                        break
+
+                if cluster_faces:
+                    vertices = cluster_vertices
+                    faces = cluster_faces
+                    uvs = cluster_uvs
+                    face_materials = cluster_face_materials
+                    vertex_colors = cluster_vertex_colors
+                    used_resource_origins = cluster_used_resource_origins
+                    used_source_kinds = cluster_used_source_kinds
+                    recovered_only_from_hidden = cluster_recovered_only_from_hidden
+                    exported_cluster_index = cluster_index
+                    if cluster_index > 0:
+                        report.streamed_diagnostics.append(
+                            f"{archive_name}: recovered geometry for {model.model_name} from alternate placement cluster {cluster_index}"
+                        )
                     break
 
-            if cluster_faces:
-                vertices = cluster_vertices
-                faces = cluster_faces
-                uvs = cluster_uvs
-                face_materials = cluster_face_materials
-                vertex_colors = cluster_vertex_colors
-                used_resource_origins = cluster_used_resource_origins
-                used_source_kinds = cluster_used_source_kinds
-                recovered_only_from_hidden = cluster_recovered_only_from_hidden
-                exported_cluster_index = cluster_index
-                if cluster_index > 0:
+            if faces:
+                mesh = MeshData(vertices=vertices, faces=faces, uvs=uvs, face_materials=face_materials, vertex_colors=vertex_colors)
+                stem = output_stem
+                if not _mesh_vertices_finite(vertices):
+                    dff_failed_models += 1
                     report.streamed_diagnostics.append(
-                        f"{archive_name}: recovered geometry for {model.model_name} from alternate placement cluster {cluster_index}"
+                        f"{archive_name}: skipped DFF export for {model.model_name}: non-finite or extreme vertex coordinates"
                     )
-                break
-
-        if faces:
-            mesh = MeshData(vertices=vertices, faces=faces, uvs=uvs, face_materials=face_materials, vertex_colors=vertex_colors)
-            stem = output_stem
-            if not _mesh_vertices_finite(vertices):
-                dff_failed_models += 1
+                    if on_model_done is not None:
+                        on_model_done(archive_name, model, False)
+                    continue
+                if bad_fragments_for_model:
+                    salvaged_models += 1
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: salvaged {model.model_name} after dropping {bad_fragments_for_model} corrupt fragment(s)"
+                    )
+                try:
+                    write_dff_from_mesh(mesh, archive_dir / f"{stem}.dff", stem)
+                except Exception as exc:
+                    dff_failed_models += 1
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: DFF export failed for {model.model_name}: {exc}"
+                    )
+                    if on_model_done is not None:
+                        on_model_done(archive_name, model, False)
+                    continue
+                try:
+                    write_col_from_mesh(mesh, archive_dir / f"{stem}.col", model_id=model.placements[0].res_id)
+                except Exception as exc:
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: collision export failed for {model.model_name}: {exc}"
+                    )
+                exported_models += 1
+                exported_output_names.add(output_stem)
+                if exported_cluster_index == 0 and model.has_hidden_alternates and visible_placements and hidden_placements:
+                    models_with_hidden_conflicts += 1
+                    report.streamed_diagnostics.append(
+                        f"{archive_name}: kept default-visible fragments for {model.model_name}; hidden alternates were left as fallback"
+                    )
+                if "area" in used_resource_origins:
+                    models_recovered_via_area += 1
+                if used_source_kinds == {"interior"}:
+                    models_recovered_only_interior += 1
+                elif "interior" in used_source_kinds:
+                    models_recovered_via_interior += 1
+                if used_source_kinds == {"swap-sector"} or recovered_only_from_hidden:
+                    models_recovered_only_swap += 1
+                elif "swap-sector" in used_source_kinds:
+                    models_recovered_via_swap += 1
+                if used_resource_origins == {"area"}:
+                    models_recovered_only_area += 1
+                _log(f"[streamed] wrote {archive_name}/{stem}.dff + .col")
+                if on_model_done is not None:
+                    on_model_done(archive_name, model, True)
+            else:
                 report.streamed_diagnostics.append(
-                    f"{archive_name}: skipped DFF export for {model.model_name}: non-finite or extreme vertex coordinates"
+                    f"{archive_name}: no geometry decoded for {model.model_name} from {total_candidate_res_ids} candidate resource ids"
                 )
                 if on_model_done is not None:
                     on_model_done(archive_name, model, False)
-                continue
-            if bad_fragments_for_model:
-                salvaged_models += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: salvaged {model.model_name} after dropping {bad_fragments_for_model} corrupt fragment(s)"
-                )
-            try:
-                write_dff_from_mesh(mesh, archive_dir / f"{stem}.dff", stem)
-            except Exception as exc:
-                dff_failed_models += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: DFF export failed for {model.model_name}: {exc}"
-                )
-                if on_model_done is not None:
-                    on_model_done(archive_name, model, False)
-                continue
-            try:
-                write_col_from_mesh(mesh, archive_dir / f"{stem}.col", model_id=model.placements[0].res_id)
-            except Exception as exc:
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: collision export failed for {model.model_name}: {exc}"
-                )
-            exported_models += 1
-            exported_output_names.add(output_stem)
-            if exported_cluster_index == 0 and model.has_hidden_alternates and visible_placements and hidden_placements:
-                models_with_hidden_conflicts += 1
-                report.streamed_diagnostics.append(
-                    f"{archive_name}: kept default-visible fragments for {model.model_name}; hidden alternates were left as fallback"
-                )
-            if "area" in used_resource_origins:
-                models_recovered_via_area += 1
-            if used_source_kinds == {"interior"}:
-                models_recovered_only_interior += 1
-            elif "interior" in used_source_kinds:
-                models_recovered_via_interior += 1
-            if used_source_kinds == {"swap-sector"} or recovered_only_from_hidden:
-                models_recovered_only_swap += 1
-            elif "swap-sector" in used_source_kinds:
-                models_recovered_via_swap += 1
-            if used_resource_origins == {"area"}:
-                models_recovered_only_area += 1
-            _log(f"[streamed] wrote {archive_name}/{stem}.dff + .col")
-            if on_model_done is not None:
-                on_model_done(archive_name, model, True)
-        else:
-            report.streamed_diagnostics.append(
-                f"{archive_name}: no geometry decoded for {model.model_name} from {total_candidate_res_ids} candidate resource ids"
-            )
-            if on_model_done is not None:
-                on_model_done(archive_name, model, False)
 
-    for txd_name, textures in textures_by_txd.items():
-        if textures:
-            if txd_name.lower() == "knackers":
-                continue
+    write_txd_timer = timings.timed(f"streamed.export.{archive_name.lower()}.write_txds") if timings is not None else None
+    if write_txd_timer is not None:
+        write_txd_timer.__enter__()
+    try:
+        for txd_name, textures in textures_by_txd.items():
+            if textures:
+                if txd_name.lower() == "knackers":
+                    continue
+                write_txd_from_decoded_textures(
+                    archive_dir / f"{sanitize_filename(txd_name)}.txd",
+                    list(textures.values()),
+                    dxt_level=dxt_level,
+                )
+                _log(f"[streamed] wrote {archive_name}/{sanitize_filename(txd_name)}.txd")
+
+        if global_knackers_textures is None and knackers_textures:
             write_txd_from_decoded_textures(
-                archive_dir / f"{sanitize_filename(txd_name)}.txd",
-                list(textures.values()),
+                output_root / "knackers.txd",
+                list(knackers_textures.values()),
                 dxt_level=dxt_level,
             )
-            _log(f"[streamed] wrote {archive_name}/{sanitize_filename(txd_name)}.txd")
-
-    if global_knackers_textures is None and knackers_textures:
-        write_txd_from_decoded_textures(
-            output_root / "knackers.txd",
-            list(knackers_textures.values()),
-            dxt_level=dxt_level,
-        )
-        _log("[streamed] updated knackers.txd")
+            _log("[streamed] updated knackers.txd")
+    finally:
+        if write_txd_timer is not None:
+            write_txd_timer.__exit__(None, None, None)
 
     return {
         "exported_models": exported_models,
@@ -1686,6 +1773,19 @@ def _mesh_vertices_finite(vertices: list[tuple[float, float, float]]) -> bool:
             return False
         if max(abs(x), abs(y), abs(z)) > 1e20:
             return False
+    return True
+
+
+def _fragment_vertex_array_valid(vertex_array: np.ndarray) -> bool:
+    if vertex_array.size == 0:
+        return False
+    if not np.isfinite(vertex_array).all():
+        return False
+    if float(np.max(np.abs(vertex_array))) > 1_000_000.0:
+        return False
+    spans = vertex_array.max(axis=0) - vertex_array.min(axis=0)
+    if float(np.max(spans)) > 1_000_000.0:
+        return False
     return True
 
 

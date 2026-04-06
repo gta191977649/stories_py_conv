@@ -35,6 +35,7 @@ class ConversionResult:
 @dataclass(slots=True)
 class ReportData:
     summary_by_archive: dict[str, dict[str, int]] = field(default_factory=dict)
+    pipeline_timings: dict[str, dict[str, float | int]] = field(default_factory=dict)
     unresolved_streamed_names: list[str] = field(default_factory=list)
     duplicate_pack_conflicts: list[str] = field(default_factory=list)
     knackers_texture_conflicts: list[str] = field(default_factory=list)

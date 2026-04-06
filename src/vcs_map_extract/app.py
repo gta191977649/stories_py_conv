@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -14,6 +15,7 @@ from .ipl_parser import merge_ipl_summaries, parse_ipl_directory
 from .models import ReportData, StreamedArchivePlan
 from .name_resolver import NameResolver
 from .packimg import set_log_sink as set_packimg_log_sink, write_packed_img
+from .perf import TimingRecorder
 from .progress import ProgressDisplay
 from .reference_data import load_vcs_name_table
 from .report import write_report
@@ -264,6 +266,34 @@ def _compute_vcsnames_coverage(
     return coverage, missing_geometry, non_geometry
 
 
+def _merge_streamed_archive_report(
+    report: ReportData,
+    archive_report: ReportData,
+) -> None:
+    report.unresolved_streamed_names.extend(archive_report.unresolved_streamed_names)
+    report.duplicate_pack_conflicts.extend(archive_report.duplicate_pack_conflicts)
+    report.knackers_texture_conflicts.extend(archive_report.knackers_texture_conflicts)
+    report.streamed_texture_conflicts.extend(archive_report.streamed_texture_conflicts)
+    report.streamed_diagnostics.extend(archive_report.streamed_diagnostics)
+    report.interior_diagnostics.extend(archive_report.interior_diagnostics)
+
+
+def _merge_knackers_textures(
+    report: ReportData,
+    archive_name: str,
+    target: dict[str, "DecodedTexture"],
+    incoming: dict[str, "DecodedTexture"],
+) -> None:
+    for texture_name, texture in incoming.items():
+        existing = target.get(texture_name)
+        if existing is not None and existing.rgba != texture.rgba:
+            report.knackers_texture_conflicts.append(
+                f"{archive_name}: texture '{texture_name}' had conflicting data; kept higher-resolution copy"
+            )
+        if existing is None or (texture.width * texture.height) > (existing.width * existing.height):
+            target[texture_name] = texture
+
+
 def _progress_phase_count(clean: bool, export: bool, buildimg: bool, decode_dat: bool) -> int:
     phases = 0
     phases += int(clean)
@@ -287,11 +317,13 @@ def run(
     output_root = Path(output_path).expanduser().resolve()
     safe_mkdir(output_root)
     progress = ProgressDisplay(_progress_phase_count(clean, export, buildimg, decode_dat))
+    timings = TimingRecorder()
     try:
         if clean:
             progress.start_phase("Clean Output", 1, unit="task")
-            _clean_output_dir(output_root)
-            safe_mkdir(output_root)
+            with timings.timed("app.clean_output"):
+                _clean_output_dir(output_root)
+                safe_mkdir(output_root)
             progress.advance(detail=output_root.name)
             progress.finish_phase(summary=f"Cleaned {output_root}")
             if not export and not decode_dat:
@@ -300,7 +332,8 @@ def run(
         if decode_dat:
             game_dat_path = _validate_game_dat(root)
             progress.start_phase("Decode GAME.dat", 1, unit="task")
-            stats = decode_game_dat(game_dat_path, output_root)
+            with timings.timed("app.decode_game_dat"):
+                stats = decode_game_dat(game_dat_path, output_root)
             progress.advance(detail=game_dat_path.name)
             progress.finish_phase(
                 summary=(
@@ -325,66 +358,70 @@ def run(
         from .streamed_world import plan_streamed_archive
 
         progress.start_phase("Load Metadata", 1, unit="task")
-        for archive_name in ARCHIVE_ORDER:
-            safe_mkdir(output_root / archive_name)
-        _cleanup_stale_generated_outputs(output_root)
-        ide_catalog = parse_ide_directory(root / "ide")
-        game_dat = None
-        game_dat_models = None
-        game_dat_path = root / "GAME.dat"
-        if game_dat_path.is_file():
-            try:
-                game_dat = GameDat.from_path(game_dat_path)
-                game_dat_models = game_dat.model_info_by_id
-            except Exception as exc:
-                progress.log(f"[names] failed to read {game_dat_path}: {exc}")
-        resolver = NameResolver(ide_catalog, game_dat_models=game_dat_models)
-        report = ReportData()
-        summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        ipl_summary = parse_ipl_directory(root / "ipl")
-        if game_dat is not None:
-            ipl_summary = merge_ipl_summaries(ipl_summary, game_dat.build_ipl_summary())
-        for source_file in sorted(ipl_summary.inst_count_by_file):
-            report.ipl_diagnostics.append(
-                f"{source_file}: inst_rows={ipl_summary.inst_count_by_file[source_file]}, "
-                f"nonzero_interiors={ipl_summary.nonzero_interior_by_file.get(source_file, 0)}"
-            )
-        if any(ipl_summary.nonzero_interior_by_file.values()):
-            report.ipl_diagnostics.append(
-                f"nonzero interior IPL rows detected: {len(ipl_summary.nonzero_instances)}"
-            )
-        else:
-            report.ipl_diagnostics.append(
-                "ipl/*.ipl did not expose nonzero interior ids in this dump; LVZ interior swaps were used instead"
-            )
+        with timings.timed("app.load_metadata"):
+            for archive_name in ARCHIVE_ORDER:
+                safe_mkdir(output_root / archive_name)
+            _cleanup_stale_generated_outputs(output_root)
+            ide_catalog = parse_ide_directory(root / "ide")
+            game_dat = None
+            game_dat_models = None
+            game_dat_path = root / "GAME.dat"
+            if game_dat_path.is_file():
+                try:
+                    game_dat = GameDat.from_path(game_dat_path)
+                    game_dat_models = game_dat.model_info_by_id
+                except Exception as exc:
+                    progress.log(f"[names] failed to read {game_dat_path}: {exc}")
+            resolver = NameResolver(ide_catalog, game_dat_models=game_dat_models)
+            report = ReportData()
+            summary: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            ipl_summary = parse_ipl_directory(root / "ipl")
+            if game_dat is not None:
+                ipl_summary = merge_ipl_summaries(ipl_summary, game_dat.build_ipl_summary())
+            for source_file in sorted(ipl_summary.inst_count_by_file):
+                report.ipl_diagnostics.append(
+                    f"{source_file}: inst_rows={ipl_summary.inst_count_by_file[source_file]}, "
+                    f"nonzero_interiors={ipl_summary.nonzero_interior_by_file.get(source_file, 0)}"
+                )
+            if any(ipl_summary.nonzero_interior_by_file.values()):
+                report.ipl_diagnostics.append(
+                    f"nonzero interior IPL rows detected: {len(ipl_summary.nonzero_instances)}"
+                )
+            else:
+                report.ipl_diagnostics.append(
+                    "ipl/*.ipl did not expose nonzero interior ids in this dump; LVZ interior swaps were used instead"
+                )
         progress.advance(detail=f"{len(ide_catalog)} IDE models")
         progress.finish_phase(summary="Loaded IDE, IPL, and GAME.dat metadata")
 
         with tempfile.TemporaryDirectory(prefix="vcs_map_extract_raw_") as tmpdir:
             progress.start_phase("Queue Standard Assets", len(STANDARD_ARCHIVES), unit="archive")
-            standard_jobs = _queue_standard_jobs(
-                Path(tmpdir),
-                root,
-                output_root,
-                ide_catalog,
-                resolver,
-                summary,
-                on_archive_done=lambda archive_name, models, txds, cols: progress.advance(
-                    detail=f"{archive_name}: {models} dff, {txds} txd, {cols} col"
-                ),
-            )
+            with timings.timed("app.queue_standard_assets"):
+                standard_jobs = _queue_standard_jobs(
+                    Path(tmpdir),
+                    root,
+                    output_root,
+                    ide_catalog,
+                    resolver,
+                    summary,
+                    on_archive_done=lambda archive_name, models, txds, cols: progress.advance(
+                        detail=f"{archive_name}: {models} dff, {txds} txd, {cols} col"
+                    ),
+                )
             progress.finish_phase(summary=f"Queued {len(standard_jobs)} standard conversion jobs")
 
             progress.start_phase("Convert Standard Assets", len(standard_jobs), unit="job")
-            standard_results = run_conversion_jobs(
-                standard_jobs,
-                dxt_level=dxt_level,
-                log=progress.log,
-                log_success=False,
-                on_job_done=lambda job, result: progress.advance(
-                    detail=f"{job['archive']} {job['type']} {'ok' if result.get('ok') else 'failed'}"
-                ),
-            ) if standard_jobs else []
+            with timings.timed("app.convert_standard_assets"):
+                standard_results = run_conversion_jobs(
+                    standard_jobs,
+                    dxt_level=dxt_level,
+                    log=progress.log,
+                    log_success=False,
+                    on_job_done=lambda job, result: progress.advance(
+                        detail=f"{job['archive']} {job['type']} {'ok' if result.get('ok') else 'failed'}"
+                    ),
+                    timings=timings,
+                ) if standard_jobs else []
             progress.finish_phase(summary=f"Completed {len(standard_results)} standard jobs")
             _summarize_standard_results(standard_results, summary, report)
 
@@ -392,12 +429,14 @@ def run(
         streamed_plans: list[StreamedArchivePlan] = []
         previous_streamed_sink = set_streamed_log_sink(None)
         try:
-            for archive_name in STREAMED_ARCHIVES:
-                plan = plan_streamed_archive(root, archive_name, ide_catalog, resolver)
-                streamed_plans.append(plan)
-                summary[archive_name].update(plan.summary)
-                report.unresolved_streamed_names.extend(plan.unresolved_names)
-                progress.advance(detail=f"{archive_name}: {len(plan.model_exports)} models")
+            with timings.timed("app.analyse_streamed_archives"):
+                for archive_name in STREAMED_ARCHIVES:
+                    with timings.timed(f"streamed.plan.{archive_name.lower()}"):
+                        plan = plan_streamed_archive(root, archive_name, ide_catalog, resolver)
+                    streamed_plans.append(plan)
+                    summary[archive_name].update(plan.summary)
+                    report.unresolved_streamed_names.extend(plan.unresolved_names)
+                    progress.advance(detail=f"{archive_name}: {len(plan.model_exports)} models")
         finally:
             set_streamed_log_sink(previous_streamed_sink)
         progress.finish_phase(summary="Planned streamed archive exports")
@@ -407,42 +446,59 @@ def run(
         global_knackers_textures: dict[str, "DecodedTexture"] = {}
         previous_streamed_sink = set_streamed_log_sink(None)
         try:
-            for plan in streamed_plans:
-                archive_name = plan.archive_name
-                if not plan.model_exports and not plan.txd_exports:
-                    continue
-                try:
+            with timings.timed("app.export_streamed_models"):
+                active_plans = [plan for plan in streamed_plans if plan.model_exports or plan.txd_exports]
+
+                def run_streamed_plan(plan: StreamedArchivePlan) -> tuple[str, dict[str, int], ReportData, dict[str, "DecodedTexture"], int]:
+                    archive_report = ReportData()
+                    archive_knackers: dict[str, "DecodedTexture"] = {}
                     metrics = export_streamed_archive(
-                        archive_name,
+                        plan.archive_name,
                         root,
                         output_root,
                         plan,
-                        report,
+                        archive_report,
                         dxt_level=dxt_level,
-                        global_knackers_textures=global_knackers_textures,
+                        global_knackers_textures=archive_knackers,
                         ipl_summary=ipl_summary,
-                        on_model_done=lambda archive, model, exported: progress.advance(
-                            detail=f"{archive}: {model.output_name} {'exported' if exported else 'skipped'}"
-                        ),
+                        on_model_done=None,
+                        timings=timings,
                     )
-                    summary[archive_name].update(metrics)
-                except Exception as exc:
-                    report.unresolved_streamed_names.append(f"{archive_name}: streamed export failed: {exc}")
-                    summary[archive_name]["streamed_failed"] = 1
-                    progress.log(f"[streamed] FAILED {archive_name}: {exc}")
+                    return plan.archive_name, metrics, archive_report, archive_knackers, len(plan.model_exports)
+
+                with ThreadPoolExecutor(max_workers=max(1, min(len(active_plans), len(STREAMED_ARCHIVES)))) as executor:
+                    futures = [
+                        (plan, executor.submit(run_streamed_plan, plan))
+                        for plan in active_plans
+                    ]
+                    for plan, future in futures:
+                        archive_name = plan.archive_name
+                        try:
+                            archive_name, metrics, archive_report, archive_knackers, model_count = future.result()
+                            summary[archive_name].update(metrics)
+                            _merge_streamed_archive_report(report, archive_report)
+                            _merge_knackers_textures(report, archive_name, global_knackers_textures, archive_knackers)
+                            progress.advance(model_count, detail=f"{archive_name}: {metrics.get('exported_models', 0)} exported")
+                        except Exception as exc:
+                            report.unresolved_streamed_names.append(f"{archive_name}: streamed export failed: {exc}")
+                            summary[archive_name]["streamed_failed"] = 1
+                            progress.advance(len(plan.model_exports), detail=f"{archive_name}: failed")
+                            progress.log(f"[streamed] FAILED {archive_name}: {exc}")
         finally:
             set_streamed_log_sink(previous_streamed_sink)
         progress.finish_phase(summary="Finished streamed model export")
 
-        if global_knackers_textures:
-            write_txd_from_decoded_textures(
-                output_root / "knackers.txd",
-                list(global_knackers_textures.values()),
-                dxt_level=dxt_level,
-            )
-        _ensure_knackers_txd(output_root)
+        with timings.timed("app.write_global_knackers_txd"):
+            if global_knackers_textures:
+                write_txd_from_decoded_textures(
+                    output_root / "knackers.txd",
+                    list(global_knackers_textures.values()),
+                    dxt_level=dxt_level,
+                )
+            _ensure_knackers_txd(output_root)
 
         report.summary_by_archive = {name: dict(summary[name]) for name in ARCHIVE_ORDER}
+        report.pipeline_timings = timings.snapshot()
         exported_stems_by_archive = {
             archive: {
                 path.stem
@@ -485,7 +541,8 @@ def run(
             progress.start_phase("Build IMG", 1, unit="task")
             previous_packimg_sink = set_packimg_log_sink(None)
             try:
-                packed_paths, conflicts = write_packed_img(output_root)
+                with timings.timed("app.build_img"):
+                    packed_paths, conflicts = write_packed_img(output_root)
             finally:
                 set_packimg_log_sink(previous_packimg_sink)
             report.duplicate_pack_conflicts.extend(conflicts)
@@ -493,7 +550,9 @@ def run(
             progress.finish_phase(summary=f"Packed {', '.join(path.name for path in packed_paths)}")
 
         progress.start_phase("Write Report", 1, unit="task")
-        write_report(output_root / "report.txt", report)
+        report.pipeline_timings = timings.snapshot()
+        with timings.timed("app.write_report"):
+            write_report(output_root / "report.txt", report)
         progress.advance(detail="report.txt")
         progress.finish_phase(summary="Wrote report.txt")
         progress.log("Extraction finished")

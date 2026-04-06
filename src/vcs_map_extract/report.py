@@ -14,6 +14,16 @@ def write_report(path: Path, report: ReportData) -> None:
         lines.append(f"{archive}: {bits}")
 
     lines.append("")
+    lines.append("Pipeline Timings")
+    if report.pipeline_timings:
+        for name, metrics in report.pipeline_timings.items():
+            lines.append(
+                f"{name}: count={metrics.get('count', 0)}, seconds={metrics.get('seconds', 0.0):.6f}"
+            )
+    else:
+        lines.append("<none>")
+
+    lines.append("")
     lines.append("Missing Models")
     lines.extend(report.missing_models or ["<none>"])
 
