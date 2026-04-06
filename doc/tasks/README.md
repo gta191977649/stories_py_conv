@@ -30,3 +30,6 @@ Current tasks:
 - [`/doc/tasks/T003 Streamed Texture Name Noise Filter.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T003%20Streamed%20Texture%20Name%20Noise%20Filter.md)
 - [`/doc/tasks/T004 Opaque DXT1 Transparent Block Fix.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T004%20Opaque%20DXT1%20Transparent%20Block%20Fix.md)
 - [`/doc/tasks/T005 Hidden Pass Supplemental Streamed Textures.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T005%20Hidden%20Pass%20Supplemental%20Streamed%20Textures.md)
+- [`/doc/tasks/T006 Tiny Indexed Streamed Gradient Decode.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T006%20Tiny%20Indexed%20Streamed%20Gradient%20Decode.md)
+- [`/doc/tasks/T007 Streamed Neon Material Texture Recovery.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T007%20Streamed%20Neon%20Material%20Texture%20Recovery.md)
+- [`/doc/tasks/T008 Simplify VCS Name Table Loading.md`](/Users/nurupo/Desktop/dev/stories_py_conv/doc/tasks/T008%20Simplify%20VCS%20Name%20Table%20Loading.md)

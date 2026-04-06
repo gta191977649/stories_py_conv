@@ -197,11 +197,29 @@ def _make_ps2_header_variant(
 def _texture_decode_score(rgba: np.ndarray) -> float:
     if rgba.size == 0:
         return float("-inf")
+    # The alternate header search below intentionally tries several decode
+    # interpretations because some streamed headers lie about swizzle or
+    # dimensions. This baseline score prefers coherent images over obviously
+    # scrambled ones.
     horizontal_matches = float(np.mean(np.all(rgba[:, 1:, :] == rgba[:, :-1, :], axis=2))) if rgba.shape[1] > 1 else 1.0
     vertical_matches = float(np.mean(np.all(rgba[1:, :, :] == rgba[:-1, :, :], axis=2))) if rgba.shape[0] > 1 else 1.0
     delta_h = float(np.mean(np.abs(np.diff(rgba[:, :, :3].astype(np.int16), axis=1)))) if rgba.shape[1] > 1 else 0.0
     delta_v = float(np.mean(np.abs(np.diff(rgba[:, :, :3].astype(np.int16), axis=0)))) if rgba.shape[0] > 1 else 0.0
     return (horizontal_matches + vertical_matches) - ((delta_h + delta_v) / 255.0)
+
+
+def _tiny_indexed_texture_bonus(rgba: np.ndarray, *, bpp: int) -> float:
+    # Tiny indexed gradients are a bad fit for the generic "flatness" score
+    # above: the wrong swizzle can look artificially orderly. For <= 8x8
+    # paletted textures, reward decodes that preserve more distinct palette
+    # colors so ramps win over mosaic-like false positives.
+    if bpp not in {4, 8}:
+        return 0.0
+    pixel_count = int(rgba.shape[0] * rgba.shape[1])
+    if pixel_count <= 0 or pixel_count > 64:
+        return 0.0
+    unique_colors = int(np.unique(rgba.reshape((-1, 4)), axis=0).shape[0])
+    return unique_colors / float(pixel_count)
 
 
 def _is_plausible_embedded_texture_name(candidate: str) -> bool:
@@ -237,6 +255,22 @@ def _vertex_array_bounds_signature(vertex_array: np.ndarray) -> tuple[float, ...
     mins = vertex_array.min(axis=0)
     maxs = vertex_array.max(axis=0)
     return tuple(round(float(value), 4) for value in (*mins.tolist(), *maxs.tolist()))
+
+
+def _localized_geometry_signature(
+    transformed_vertex_array: np.ndarray,
+    geometry: ParsedStreamedGeometry,
+) -> str:
+    vertex_bytes = np.round(transformed_vertex_array, 4).astype(np.float32, copy=False).tobytes()
+    face_bytes = geometry.face_array.astype(np.int32, copy=False).tobytes()
+    uv_bytes = np.round(geometry.uv_array, 4).astype(np.float32, copy=False).tobytes()
+    texture_bytes = np.asarray(geometry.face_texture_res_ids, dtype=np.int32).tobytes()
+    digest = hashlib.sha1()
+    digest.update(vertex_bytes)
+    digest.update(face_bytes)
+    digest.update(uv_bytes)
+    digest.update(texture_bytes)
+    return digest.hexdigest()
 
 
 def _matrix_signature(matrix: np.ndarray) -> tuple[float, ...]:
@@ -588,6 +622,10 @@ class LVZArchive:
         if block_size <= 0:
             return None
 
+        # Real streamed rasters are messy: dimensions can be swapped, swizzle
+        # bits can be wrong, and 4-bit textures sometimes need the opposite
+        # nibble order. Try the small set of known-bad permutations and score
+        # the outputs instead of hard-coding one interpretation.
         header_variants: list[Ps2TexHeader] = [_make_ps2_header_variant(header)]
         if header.width != header.height:
             header_variants.append(_make_ps2_header_variant(header, width=header.height, height=header.width))
@@ -621,7 +659,7 @@ class LVZArchive:
                 )
                 if rgba is None:
                     continue
-                score = _texture_decode_score(rgba)
+                score = _texture_decode_score(rgba) + _tiny_indexed_texture_bonus(rgba, bpp=header.bpp)
                 if score > best_score:
                     best_score = score
                     best_rgba = rgba
@@ -873,7 +911,11 @@ class LVZArchive:
                 )
             )
         remaining = len(blob) - data_start
-        if total_packets <= 0 or total_packets > remaining:
+        # Some overlay variants advertise a packet size larger than the bytes
+        # actually present in the sector blob. Keep them on the streamed packet
+        # path and let packet parsing clamp to available bytes; falling back to
+        # the MDL path here loses the intended streamed fragment layout.
+        if total_packets <= 0 or remaining <= 0:
             return None
         return meshes, data_start
 
@@ -1551,42 +1593,69 @@ def export_streamed_archive(
                                 f"source={placement.source_kind})"
                             )
                             continue
+                        # First choose the dominant localized variant family:
+                        # origin priority + face/vertex richness. After that,
+                        # keep any same-priority same-bounds variants that add
+                        # distinct geometry instead of assuming one variant per
+                        # res_id. Neon/sign models often split real faces this
+                        # way across overlay blobs.
                         _match_dominant, _origin_rank, _face_count, _vert_count, selected_variant, transformed_vertex_array, bounds_signature = max(
                             candidate_rows,
                             key=lambda item: (item[0], item[1], item[2], item[3]),
                         )
                         signature_counts[bounds_signature] = signature_counts.get(bounds_signature, 0) + 1
-                        geometry = selected_variant.geometry
-                        fragment_key = (
-                            placement.res_id,
-                            *_variant_cache_key(selected_variant.variant),
-                            *bounds_signature,
+                        selected_origin_rank = _origin_rank
+                        selected_bounds_signature = bounds_signature
+                        accepted_geometry_signatures: set[str] = set()
+                        selected_rows = sorted(
+                            (
+                                row
+                                for row in candidate_rows
+                                if row[1] == selected_origin_rank and row[6] == selected_bounds_signature
+                            ),
+                            key=lambda item: (item[0], item[1], item[2], item[3]),
+                            reverse=True,
                         )
-                        if fragment_key in cluster_seen_fragments or fragment_key in set_fragment_keys:
-                            continue
-                        set_fragment_keys.add(fragment_key)
-                        base_index = len(set_vertices)
-                        transformed_vertices = [tuple(vertex) for vertex in transformed_vertex_array.tolist()]
-                        set_vertices.extend(transformed_vertices)
-                        set_uvs.extend(geometry.uvs)
-                        set_vertex_colors.extend(geometry.vertex_colors)
-                        set_used_resource_origins.add(geometry.resource_origin)
-                        set_used_source_kinds.add(placement.source_kind)
-                        resolved_textures_by_res_id: dict[int, DecodedTexture] = {}
-                        resolved_texture_names_by_res_id: dict[int, str] = {}
-                        for texture_res_id in geometry.unique_texture_res_ids:
-                            texture = _unwrap_texture_result(archive.texture_for_res_id(texture_res_id))
-                            if texture is None:
+                        for _row_match_dominant, _row_origin_rank, _row_face_count, _row_vert_count, row_variant, row_transformed_vertex_array, row_bounds_signature in selected_rows:
+                            geometry = row_variant.geometry
+                            # Compare localized geometry content, not just
+                            # res_id or bounds. Two overlay variants can land
+                            # in the same place but still contribute different
+                            # faces/material assignments.
+                            geometry_signature = _localized_geometry_signature(row_transformed_vertex_array, geometry)
+                            if geometry_signature in accepted_geometry_signatures:
                                 continue
-                            resolved_textures_by_res_id[texture_res_id] = texture
-                            resolved_texture_names_by_res_id[texture_res_id] = texture.name
-                            if model.txd_name:
-                                set_textures.append((texture.name, texture))
-                        set_texture_ref_ids.update(geometry.unique_texture_res_ids)
-                        for face_index, (a, b, c) in enumerate(geometry.faces):
-                            set_faces.append((base_index + a, base_index + b, base_index + c))
-                            texture_res_id = geometry.face_texture_res_ids[face_index]
-                            set_face_materials.append(resolved_texture_names_by_res_id.get(texture_res_id, ""))
+                            fragment_key = (
+                                placement.res_id,
+                                *_variant_cache_key(row_variant.variant),
+                                *row_bounds_signature,
+                            )
+                            if fragment_key in cluster_seen_fragments or fragment_key in set_fragment_keys:
+                                continue
+                            accepted_geometry_signatures.add(geometry_signature)
+                            set_fragment_keys.add(fragment_key)
+                            base_index = len(set_vertices)
+                            transformed_vertices = [tuple(vertex) for vertex in row_transformed_vertex_array.tolist()]
+                            set_vertices.extend(transformed_vertices)
+                            set_uvs.extend(geometry.uvs)
+                            set_vertex_colors.extend(geometry.vertex_colors)
+                            set_used_resource_origins.add(geometry.resource_origin)
+                            set_used_source_kinds.add(placement.source_kind)
+                            resolved_textures_by_res_id: dict[int, DecodedTexture] = {}
+                            resolved_texture_names_by_res_id: dict[int, str] = {}
+                            for texture_res_id in geometry.unique_texture_res_ids:
+                                texture = _unwrap_texture_result(archive.texture_for_res_id(texture_res_id))
+                                if texture is None:
+                                    continue
+                                resolved_textures_by_res_id[texture_res_id] = texture
+                                resolved_texture_names_by_res_id[texture_res_id] = texture.name
+                                if model.txd_name:
+                                    set_textures.append((texture.name, texture))
+                            set_texture_ref_ids.update(geometry.unique_texture_res_ids)
+                            for face_index, (a, b, c) in enumerate(geometry.faces):
+                                set_faces.append((base_index + a, base_index + b, base_index + c))
+                                texture_res_id = geometry.face_texture_res_ids[face_index]
+                                set_face_materials.append(resolved_texture_names_by_res_id.get(texture_res_id, ""))
                     if not set_faces:
                         continue
                     accept_set = False
